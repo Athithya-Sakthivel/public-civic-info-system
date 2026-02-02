@@ -36,10 +36,6 @@ build-retriever: $(RETRIEVER_ZIP)
 build-generate: $(GENERATE_ZIP)
 build-query: $(QUERY_ZIP)
 
-clean:
-	@echo "Cleaning artifacts..."
-	@rm -rf "$(ARTIFACTS_DIR)"
-
 
 tree:
 	tree -I 'repos|.venv|tmp'
@@ -103,3 +99,9 @@ ls:
 ELT:
 	make run-scraper
 	python3 indexing_pipeline/ELT/parse_chunk_store/router.py
+
+push-indexing-image:
+	bash indexing_pipeline/build_and_push_image.sh
+
+pulumi-indexing-cronjob:
+	bash infra/pulumi_aws/indexing_cronjob/run.sh create

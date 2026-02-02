@@ -1,3 +1,4 @@
+pip===24.3.1
 pulumi==3.218.0
 pulumi-aws==7.16.0
 pulumi-awsx==3.1.0
