@@ -1,0 +1,10 @@
+{
+  "file_hash": "8eaa6d4607dd46b93b83c48d67b201c17afb780ea578b54e40ab4469d83f3d91",
+  "mime_ext": "",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1769730239",
+  "s3_key": "data/raw/www.nhm.tn.gov.in_7c2854da1093/20260129T020710Z/en",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/www.nhm.tn.gov.in_7c2854da1093/20260129T020710Z/en",
+  "saved_chunks": 1,
+  "timestamp": "2026-01-29T23:48:54.967Z"
+}

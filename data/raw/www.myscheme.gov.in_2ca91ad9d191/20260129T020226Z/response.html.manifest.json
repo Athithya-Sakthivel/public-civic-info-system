@@ -1,0 +1,10 @@
+{
+  "file_hash": "92f016ef5a40e1a6e4145f1d1cd5644f4da9da1077d16b781aac7a5e00c365bc",
+  "mime_ext": "html",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1769730239",
+  "s3_key": "data/raw/www.myscheme.gov.in_2ca91ad9d191/20260129T020226Z/response.html",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/www.myscheme.gov.in_2ca91ad9d191/20260129T020226Z/response.html",
+  "saved_chunks": 1,
+  "timestamp": "2026-01-29T23:48:18.803Z"
+}

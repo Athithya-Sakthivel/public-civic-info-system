@@ -1,0 +1,4 @@
+boto3==1.42.38
+psycopg[binary]==3.2.6
+pgvector==0.4.2
+opensearch-py==3.1.0

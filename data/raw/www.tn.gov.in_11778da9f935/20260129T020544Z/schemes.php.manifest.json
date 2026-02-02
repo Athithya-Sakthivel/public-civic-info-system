@@ -1,0 +1,10 @@
+{
+  "file_hash": "d0087d80a5b37d8dfcac6d93d3e8d2f34184ef09f2967a73ae3604735a454f79",
+  "mime_ext": "php",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1769730239",
+  "s3_key": "data/raw/www.tn.gov.in_11778da9f935/20260129T020544Z/schemes.php",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/www.tn.gov.in_11778da9f935/20260129T020544Z/schemes.php",
+  "saved_chunks": 0,
+  "timestamp": "2026-01-29T23:49:14.428Z"
+}
