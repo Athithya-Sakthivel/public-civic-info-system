@@ -1,25 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os
-import sys
-import json
-import time
-import re
-import random
-import hashlib
-import tempfile
-import shutil
-import logging
-import urllib.robotparser
+import os, sys, json, time, re, random, hashlib, tempfile, shutil, logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Set, Tuple
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl
 from concurrent.futures import ThreadPoolExecutor
-import httpx
-import boto3
-from html.parser import HTMLParser
+import httpx, boto3
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -27,17 +16,12 @@ try:
 except Exception:
     _HAS_PLAYWRIGHT = False
 
-try:
-    from pypdf import PdfReader
-    _HAS_PYPDF = True
-except Exception:
-    _HAS_PYPDF = False
-
 SERVICE_NAME = os.getenv("SERVICE_NAME", "web_scraper_prod").strip()
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip() or None
 AWS_REGION = os.getenv("AWS_REGION", "").strip() or None
 SEED_URLS = [s.strip() for s in os.getenv("SEED_URLS", "").split(",") if s.strip()]
 ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
+SKIP_WEB_SCRAPING = os.getenv("SKIP_WEB_SCRAPING", "false").lower() == "true"
 MAX_TIME_IN_SECONDS = int(os.getenv("MAX_TIME_IN_SECONDS", os.getenv("MAX_RUNTIME_SECONDS", "120")))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 HTTP_RETRIES = int(os.getenv("HTTP_RETRIES", "2"))
@@ -54,10 +38,11 @@ SPOOL_DIR = os.getenv("SPOOL_DIR", "/tmp/web_scraper_spool/")
 MIN_CONTENT_WORDS = int(os.getenv("MIN_CONTENT_WORDS", "80"))
 MIN_HTML_BYTES = int(os.getenv("MIN_HTML_BYTES", str(2 * 1024)))
 MAX_CONTENT_BYTES = int(os.getenv("MAX_CONTENT_BYTES", str(250 * 1024 * 1024)))
-PDF_PATH_PATTERNS = ["/documents/", "/uploads/", "/files/", "/pdf", "/download", "attachment", ".pdf"]
-
-# idempotency: do not overwrite existing raw manifests unless FORCE_MANIFEST=true
 FORCE_MANIFEST = os.getenv("FORCE_MANIFEST", "false").lower() == "true"
+
+if SKIP_WEB_SCRAPING:
+    print(json.dumps({"ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"), "msg": "web_scraping_skipped", "reason": "SKIP_WEB_SCRAPING=true"}))
+    sys.exit(0)
 
 if not SEED_URLS:
     sys.stderr.write("FATAL: SEED_URLS environment variable must be set (comma-separated list)\n")
@@ -66,25 +51,16 @@ if not S3_BUCKET:
     sys.stderr.write("FATAL: S3_BUCKET environment variable must be set\n")
     sys.exit(2)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("web_scraper")
 
 def iso_ts() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def jlog(level: str, msg: str, **fields):
-    rec = {"ts": iso_ts(), "msg": msg}
-    if fields:
-        rec["fields"] = fields
-    text = json.dumps(rec, ensure_ascii=False, separators=(",", ":"))
-    if level == "info":
-        log.info(text)
-    elif level == "warn":
-        log.warning(text)
-    elif level == "error":
-        log.error(text)
-    else:
-        log.debug(text)
+def jlog(event: str, **fields):
+    rec = {"ts": iso_ts(), "event": event}
+    rec.update(fields)
+    log.info(json.dumps(rec, ensure_ascii=False, separators=(",", ":")))
 
 def _now_snapshot_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -140,64 +116,7 @@ def backoff_sleep(base: float, attempt: int, cap: float = 60.0) -> None:
     s = min(cap, base * (2 ** attempt)) * jitter
     time.sleep(s)
 
-class SimpleHTMLExtractor(HTMLParser):
-    def __init__(self, base_url: str):
-        super().__init__(convert_charrefs=True)
-        self.base_url = base_url
-        self._texts: List[str] = []
-        self.links: List[Dict[str, str]] = []
-        self._in_ignorable = False
-        self._in_anchor = False
-    def handle_starttag(self, tag, attrs):
-        tagl = tag.lower()
-        if tagl in ("script", "style", "noscript", "iframe"):
-            self._in_ignorable = True
-        if tagl == "a":
-            self._in_anchor = True
-            attrs_d = dict(attrs)
-            href = attrs_d.get("href") or ""
-            try:
-                full = urljoin(self.base_url, href)
-            except Exception:
-                full = href
-            self.links.append({"href": full, "text": "", "attrs": attrs_d})
-        if tagl in ("area", "link"):
-            attrs_d = dict(attrs)
-            href = attrs_d.get("href") or attrs_d.get("src") or ""
-            if href:
-                try:
-                    full = urljoin(self.base_url, href)
-                except Exception:
-                    full = href
-                self.links.append({"href": full, "text": "", "attrs": attrs_d})
-    def handle_endtag(self, tag):
-        if tag.lower() in ("script", "style", "noscript", "iframe"):
-            self._in_ignorable = False
-        if tag.lower() == "a":
-            self._in_anchor = False
-    def handle_data(self, data):
-        if not self._in_ignorable:
-            txt = data.strip()
-            if txt:
-                self._texts.append(txt)
-                if self._in_anchor and self.links:
-                    self.links[-1]["text"] += ((" " + txt) if self.links[-1]["text"] else txt)
-    def text(self) -> str:
-        return " ".join(self._texts)
-    def link_density(self) -> float:
-        words = len(self.text().split())
-        link_count = len(self.links)
-        if words == 0:
-            return float("inf") if link_count > 0 else 0.0
-        return link_count / max(1, words)
-
 class StorageClient:
-    """
-    Minimal, idempotent manifest strategy:
-      - write minimal manifest only under RAW_PREFIX/<source_id>/<snapshot_ts>/<file>.manifest.json
-      - if manifest already exists, do NOT overwrite unless FORCE_MANIFEST=true
-      - manifest content intentionally minimal and extensible by downstream tasks
-    """
     def __init__(self, s3_bucket: Optional[str] = None, aws_region: Optional[str] = None):
         self.s3_bucket = s3_bucket
         self.aws_region = aws_region
@@ -217,89 +136,107 @@ class StorageClient:
             return True
         try:
             self.s3.head_bucket(Bucket=self.s3_bucket)
-            jlog("info", "s3_preflight_ok", bucket=self.s3_bucket)
+            jlog("s3_preflight_ok", bucket=self.s3_bucket)
             return True
         except Exception as e:
-            jlog("error", "s3_preflight_failed", bucket=self.s3_bucket, error=str(e))
+            jlog("s3_preflight_failed", bucket=self.s3_bucket, error=str(e))
             return False
 
-    def s3_key(self, source_id: str, snapshot_ts: str, filename: str) -> str:
-        return f"{RAW_PREFIX.rstrip('/')}/{source_id}/{snapshot_ts}/{filename}"
+    def _by_hash_key(self, source_id: str, sha: str, ext: str) -> str:
+        return f"{RAW_PREFIX.rstrip('/')}/{source_id}/by-hash/{sha}.{ext}"
 
-    def upload_binary(self, source_id: str, snapshot_ts: str, filename: str, local_path: str) -> Dict[str, Any]:
-        """
-        Upload binary to object storage. Returns metadata about stored object.
-        """
+    def _latest_manifest_key(self, source_id: str, doc_id: str) -> str:
+        return f"{RAW_PREFIX.rstrip('/')}/{source_id}/latest/{doc_id}.manifest.json"
+
+    def manifest_exists_latest(self, source_id: str, doc_id: str) -> Optional[str]:
+        key = self._latest_manifest_key(source_id, doc_id)
         if self.s3:
-            key = self.s3_key(source_id, snapshot_ts, filename)
             try:
-                with open(local_path, "rb") as fh:
-                    self.s3.upload_fileobj(fh, self.s3_bucket, key)
+                self.s3.head_object(Bucket=self.s3_bucket, Key=key)
+                return f"s3://{self.s3_bucket}/{key}"
+            except ClientError:
+                return None
+            except Exception:
+                return None
+        else:
+            local = os.path.join(RAW_DATA_PATH, source_id, "latest", f"{doc_id}.manifest.json")
+            return local if os.path.exists(local) else None
+
+    def read_latest_manifest(self, source_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        path_or_s3 = self.manifest_exists_latest(source_id, doc_id)
+        if not path_or_s3:
+            return None
+        if self.s3:
+            key = self._latest_manifest_key(source_id, doc_id)
+            try:
+                obj = self.s3.get_object(Bucket=self.s3_bucket, Key=key)
+                return json.loads(obj["Body"].read().decode("utf-8"))
+            except Exception:
+                return None
+        else:
+            try:
+                with open(path_or_s3, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:
+                return None
+
+    def upload_binary_by_hash(self, source_id: str, sha: str, ext: str, local_path: str) -> Dict[str, Any]:
+        key = self._by_hash_key(source_id, sha, ext)
+        if self.s3:
+            try:
+                self.s3.head_object(Bucket=self.s3_bucket, Key=key)
                 head = self.s3.head_object(Bucket=self.s3_bucket, Key=key)
-                return {
-                    "storage_url": f"s3://{self.s3_bucket}/{key}",
-                    "storage_etag": head.get("ETag"),
-                    "storage_version_id": head.get("VersionId"),
-                    "size_bytes": head.get("ContentLength")
-                }
-            except Exception as e:
-                # spool locally for retry later
+                return {"storage_url": f"s3://{self.s3_bucket}/{key}", "storage_etag": head.get("ETag"), "size_bytes": head.get("ContentLength")}
+            except ClientError:
                 try:
-                    spool_name = os.path.join(self.spool_dir, f"{int(time.time())}_{filename}")
-                    shutil.copy(local_path, spool_name)
-                    jlog("warn", "s3_upload_failed_spooled", bucket=self.s3_bucket, key=key, spool=spool_name, error=str(e))
-                except Exception as se:
-                    jlog("error", "s3_upload_and_spool_failed", bucket=self.s3_bucket, key=key, error=str(e), spool_error=str(se))
+                    with open(local_path, "rb") as fh:
+                        self.s3.upload_fileobj(fh, self.s3_bucket, key)
+                    head = self.s3.head_object(Bucket=self.s3_bucket, Key=key)
+                    return {"storage_url": f"s3://{self.s3_bucket}/{key}", "storage_etag": head.get("ETag"), "size_bytes": head.get("ContentLength")}
+                except Exception as e:
+                    try:
+                        spool_name = os.path.join(self.spool_dir, f"{int(time.time())}_{Path(local_path).name}")
+                        shutil.copy(local_path, spool_name)
+                        jlog("s3_upload_failed_spooled", bucket=self.s3_bucket, key=key, spool=spool_name, error=str(e))
+                    except Exception as se:
+                        jlog("s3_upload_and_spool_failed", bucket=self.s3_bucket, key=key, error=str(e), spool_error=str(se))
+                    raise
+            except Exception as e:
+                jlog("s3_head_failed", bucket=self.s3_bucket, key=key, error=str(e))
                 raise
         else:
-            dest_dir = os.path.join(RAW_DATA_PATH, source_id, snapshot_ts)
+            dest_dir = os.path.join(RAW_DATA_PATH, source_id, "by-hash")
             Path(dest_dir).mkdir(parents=True, exist_ok=True)
-            dest_path = os.path.join(dest_dir, filename)
+            dest_path = os.path.join(dest_dir, f"{sha}.{ext}")
+            if os.path.exists(dest_path):
+                return {"storage_url": dest_path, "storage_etag": None, "size_bytes": os.path.getsize(dest_path)}
             try:
                 shutil.move(local_path, dest_path)
-                return {"storage_url": dest_path, "storage_etag": None, "storage_version_id": None, "size_bytes": os.path.getsize(dest_path)}
+                return {"storage_url": dest_path, "storage_etag": None, "size_bytes": os.path.getsize(dest_path)}
             except Exception as e:
-                jlog("error", "local_store_failed", src=local_path, dst=dest_path, error=str(e))
+                jlog("local_store_failed", src=local_path, dst=dest_path, error=str(e))
                 raise
 
-    def _manifest_full_key(self, source_id: str, snapshot_ts: str, manifest_filename: str) -> Tuple[str, str]:
-        """
-        Return (full_key, local_path)
-        """
-        full_key = self.s3_key(source_id, snapshot_ts, manifest_filename)
-        local_dir = os.path.join(RAW_DATA_PATH, source_id, snapshot_ts)
-        local_path = os.path.join(local_dir, manifest_filename)
-        return full_key, local_path
-
-    def write_manifest(self, source_id: str, snapshot_ts: str, filename: str, manifest_obj: Dict[str, Any]) -> str:
-        """
-        Write minimal manifest under RAW_PREFIX. Idempotent: if manifest exists, do not overwrite (unless FORCE_MANIFEST).
-        Returns storage path (s3://... or local path).
-        """
-        manifest_filename = f"{filename}.manifest.json"
-        full_key, local_path = self._manifest_full_key(source_id, snapshot_ts, manifest_filename)
-
-        # S3 path
+    def write_latest_manifest(self, source_id: str, doc_id: str, manifest_obj: Dict[str, Any]) -> str:
+        key = self._latest_manifest_key(source_id, doc_id)
         if self.s3:
             try:
-                # if exists and not forced -> return existing s3 path
                 if not FORCE_MANIFEST:
                     try:
-                        self.s3.head_object(Bucket=self.s3_bucket, Key=full_key)
-                        return f"s3://{self.s3_bucket}/{full_key}"
-                    except Exception:
+                        self.s3.head_object(Bucket=self.s3_bucket, Key=key)
+                        return f"s3://{self.s3_bucket}/{key}"
+                    except ClientError:
                         pass
-                # write
                 body = json.dumps(manifest_obj, ensure_ascii=False).encode("utf-8")
-                self.s3.put_object(Bucket=self.s3_bucket, Key=full_key, Body=body, ContentType="application/json")
-                return f"s3://{self.s3_bucket}/{full_key}"
+                self.s3.put_object(Bucket=self.s3_bucket, Key=key, Body=body, ContentType="application/json")
+                return f"s3://{self.s3_bucket}/{key}"
             except Exception as e:
-                jlog("error", "s3_manifest_put_failed", key=full_key, error=str(e))
+                jlog("s3_manifest_put_failed", key=key, error=str(e))
                 raise
         else:
-            # local filesystem
-            dest_dir = os.path.dirname(local_path)
-            Path(dest_dir).mkdir(parents=True, exist_ok=True)
+            local_dir = os.path.join(RAW_DATA_PATH, source_id, "latest")
+            Path(local_dir).mkdir(parents=True, exist_ok=True)
+            local_path = os.path.join(local_dir, f"{doc_id}.manifest.json")
             if os.path.exists(local_path) and not FORCE_MANIFEST:
                 return local_path
             try:
@@ -307,72 +244,8 @@ class StorageClient:
                     json.dump(manifest_obj, fh, ensure_ascii=False, indent=2)
                 return local_path
             except Exception as e:
-                jlog("error", "local_manifest_write_failed", path=local_path, error=str(e))
+                jlog("local_manifest_write_failed", path=local_path, error=str(e))
                 raise
-
-class BrowserFetcher:
-    def __init__(self):
-        if not _HAS_PLAYWRIGHT:
-            raise RuntimeError("playwright_not_installed")
-    def fetch(self, url: str, timeout: float) -> Tuple[int, Dict[str, str], str, str, List[Dict[str, Any]]]:
-        captured: List[Dict[str, Any]] = []
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            context = browser.new_context(user_agent=HTTP_USER_AGENT)
-            page = context.new_page()
-            def _on_response(resp):
-                try:
-                    hdrs = resp.headers
-                    rurl = resp.url
-                    ct = (hdrs.get("content-type") or "").lower()
-                    if "application/pdf" in ct or rurl.lower().endswith(".pdf"):
-                        try:
-                            body = resp.body()
-                            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-                            tf.close()
-                            with open(tf.name, "wb") as fh:
-                                fh.write(body)
-                            captured.append({"path": tf.name, "url": rurl, "headers": dict(hdrs), "type": "pdf"})
-                        except Exception as e:
-                            jlog("warn", "browser_capture_pdf_failed", url=rurl, error=str(e))
-                    elif "application/json" in ct or rurl.lower().endswith(".json"):
-                        try:
-                            body = resp.text()
-                            captured.append({"text": body, "url": rurl, "headers": dict(hdrs), "type": "json"})
-                        except Exception as e:
-                            jlog("warn", "browser_capture_json_failed", url=rurl, error=str(e))
-                except Exception:
-                    pass
-            page.on("response", _on_response)
-            resp = None
-            try:
-                resp = page.goto(url, wait_until="networkidle", timeout=int(timeout * 1000))
-            except PlaywrightTimeoutError:
-                try:
-                    resp = page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
-                except Exception:
-                    pass
-            status = 200
-            headers = {}
-            final_url = page.url if page.url else url
-            if resp is not None:
-                try:
-                    status = resp.status
-                    try:
-                        headers = resp.all_headers()
-                    except Exception:
-                        headers = {}
-                except Exception:
-                    pass
-            try:
-                content = page.content()
-            except Exception:
-                content = ""
-            browser.close()
-            tmpf = tempfile.NamedTemporaryFile(delete=False)
-            with open(tmpf.name, "wb") as fh:
-                fh.write(content.encode("utf-8", errors="replace"))
-            return status, dict(headers), tmpf.name, final_url, captured
 
 class RobotsCache:
     def __init__(self, http: httpx.Client, ua: str):
@@ -380,6 +253,7 @@ class RobotsCache:
         self._ua = ua
         self._cache: Dict[str, Dict[str, Any]] = {}
     def _fetch(self, origin: str, robots_url: str) -> Dict[str, Any]:
+        import urllib.robotparser
         rp = urllib.robotparser.RobotFileParser()
         try:
             resp = self._http.get(robots_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": self._ua})
@@ -391,7 +265,7 @@ class RobotsCache:
                 return {"parser": rp, "status": status, "crawl_delay": cd}
             return {"parser": rp, "status": status, "crawl_delay": None}
         except Exception as e:
-            jlog("warn", "robots_fetch_error", robots_url=robots_url, error=str(e))
+            jlog("robots_fetch_error", robots_url=robots_url, error=str(e))
             return {"parser": rp, "status": None, "crawl_delay": None}
     def info_for(self, url: str) -> Dict[str, Any]:
         p = urlparse(url)
@@ -417,59 +291,65 @@ class RobotsCache:
         cd = info.get("crawl_delay")
         return float(cd) if cd is not None else DEFAULT_CRAWL_DELAY
 
-def manifest_validator_minimal(man: Dict[str, Any]) -> None:
-    """
-    Minimal manifest contract for raw layer. Intended to be small and extensible.
-    Required fields:
-      - file_hash
-      - mime_ext
-      - original_url
-      - timestamp (ISO8601)
-    """
-    required = ["file_hash", "mime_ext", "original_url", "timestamp"]
-    missing = [k for k in required if k not in man]
-    if missing:
-        raise ValueError(f"manifest missing required fields: {missing}")
-    if not isinstance(man.get("file_hash"), str) or len(man.get("file_hash", "")) < 8:
-        raise ValueError("invalid file_hash")
-    try:
-        _ = datetime.fromisoformat(man["timestamp"].replace("Z", "+00:00"))
-    except Exception:
-        raise ValueError("timestamp not ISO8601")
-
-class WorkItem:
-    def __init__(self, url: str, depth: int, priority: int, parent: Optional[str] = None, is_doc: bool = False):
-        self.url = url
-        self.depth = depth
-        self.priority = priority
-        self.parent = parent
-        self.is_doc = is_doc
-    def __lt__(self, other):
-        return self.priority < other.priority
-
-def anchor_implies_document(href: str, anchor_text: str, attrs: Dict[str, str]) -> bool:
-    txt = (anchor_text or "").lower()
-    for kw in ("download", "pdf", "guideline", "application", "form", "gazette", "notification", "circular"):
-        if kw in txt:
-            return True
-    href_l = (href or "").lower()
-    if any(p in href_l for p in PDF_PATH_PATTERNS):
-        return True
-    if any(href_l.endswith("." + e) for e in ALLOWED_EXTENSIONS):
-        return True
-    return False
-
-def is_allowed_domain(url: str) -> bool:
-    if not ALLOWED_DOMAINS:
-        return True
-    try:
-        host = urlparse(url).hostname or ""
-        for allowed in ALLOWED_DOMAINS:
-            if host.endswith(allowed):
-                return True
-        return False
-    except Exception:
-        return False
+class SimpleHTMLExtractor:
+    from html.parser import HTMLParser
+    def __init__(self, base_url: str):
+        self._parser = self.HTMLParser(convert_charrefs=True)
+        self.base_url = base_url
+        self._texts = []
+        self.links = []
+        self._in_ignorable = False
+        self._in_anchor = False
+    def feed(self, text: str):
+        self._parser.reset()
+        self._parser.convert_charrefs = True
+        self._parser.base_url = self.base_url
+        self._parser.handle_starttag = self._handle_starttag
+        self._parser.handle_endtag = self._handle_endtag
+        self._parser.handle_data = self._handle_data
+        self._parser.feed(text)
+    def _handle_starttag(self, tag, attrs):
+        tagl = tag.lower()
+        if tagl in ("script", "style", "noscript", "iframe"):
+            self._in_ignorable = True
+        if tagl == "a":
+            self._in_anchor = True
+            attrs_d = dict(attrs)
+            href = attrs_d.get("href") or ""
+            try:
+                full = urljoin(self.base_url, href)
+            except Exception:
+                full = href
+            self.links.append({"href": full, "text": "", "attrs": attrs_d})
+        if tagl in ("area", "link"):
+            attrs_d = dict(attrs)
+            href = attrs_d.get("href") or attrs_d.get("src") or ""
+            if href:
+                try:
+                    full = urljoin(self.base_url, href)
+                except Exception:
+                    full = href
+                self.links.append({"href": full, "text": "", "attrs": attrs_d})
+    def _handle_endtag(self, tag):
+        if tag.lower() in ("script", "style", "noscript", "iframe"):
+            self._in_ignorable = False
+        if tag.lower() == "a":
+            self._in_anchor = False
+    def _handle_data(self, data):
+        if not self._in_ignorable:
+            txt = data.strip()
+            if txt:
+                self._texts.append(txt)
+                if self._in_anchor and self.links:
+                    self.links[-1]["text"] += ((" " + txt) if self.links[-1]["text"] else txt)
+    def text(self) -> str:
+        return " ".join(self._texts)
+    def link_density(self) -> float:
+        words = len(self.text().split())
+        link_count = len(self.links)
+        if words == 0:
+            return float("inf") if link_count > 0 else 0.0
+        return link_count / max(1, words)
 
 class WebScraper:
     def __init__(self, storage: StorageClient):
@@ -479,16 +359,18 @@ class WebScraper:
         self.browser = None
         if _HAS_PLAYWRIGHT:
             try:
-                self.browser = BrowserFetcher()
-                jlog("info", "playwright_available")
+                from types import SimpleNamespace
+                self.browser = SimpleNamespace()
+                jlog("playwright_available")
             except Exception as e:
-                jlog("warn", "playwright_init_failed", error=str(e))
+                jlog("playwright_init_failed", error=str(e))
                 self.browser = None
         self.seen: Set[str] = set()
+        self.seen_hashes: Set[str] = set()
         self.metrics = {"fetch_attempts": 0, "fetch_success": 0, "fetch_failures": 0, "browser_captures": 0, "duplicates_skipped": 0, "bytes_ingested": 0, "manifests_written": 0, "links_harvested": 0}
         self.start_time = time.time()
-        self.api_url_regex = re.compile(r"""(?:"|')((?:/|https?://)[^"'\s]{10,300}\.json(?:\?[^\s"']*)?)["']""", re.IGNORECASE)
         self.url_regex = re.compile(r"""(?:"|')((?:/|https?://)[^"'\s]{6,400}\.(?:pdf|PDF|doc|docx|xls|xlsx|csv|zip))["']""")
+        self.api_url_regex = re.compile(r"""(?:"|')((?:/|https?://)[^"'\s]{10,300}\.json(?:\?[^\s"']*)?)["']""", re.IGNORECASE)
 
     def _time_exceeded(self) -> bool:
         return (time.time() - self.start_time) > MAX_TIME_IN_SECONDS
@@ -556,97 +438,22 @@ class WebScraper:
             pass
         return status, headers_out, tmpf_path, final_url, captured
 
-    def _browser_fetch_to_file(self, url: str) -> Tuple[int, Dict[str, str], str, str, List[Dict[str, Any]]]:
-        if not self.browser:
-            raise RuntimeError("browser_disabled")
-        return self.browser.fetch(url, timeout=HTTP_TIMEOUT)
-
-    def _extract_links_from_html(self, html_path: str, base_url: str) -> List[Dict[str, Any]]:
-        try:
-            with open(html_path, "rb") as fh:
-                text = fh.read().decode(errors="replace")
-        except Exception:
-            return []
-        extractor = SimpleHTMLExtractor(base_url=base_url)
-        extractor.feed(text)
-        links = extractor.links[:400]
-        out = []
-        for l in links:
-            out.append({"href": l.get("href"), "text": l.get("text"), "attrs": l.get("attrs")})
-        return out
-
     def _emit_pdf_manifest(self, source_host: str, file_path: str, original_url: str) -> Optional[Dict[str, Any]]:
-        """
-        For PDFs captured via browser/network: upload and write a minimal manifest to RAW_PREFIX.
-        """
         try:
             raw_sha = _compute_sha256_file(file_path)
             size_bytes = os.path.getsize(file_path)
-            snapshot_ts = _now_snapshot_ts()
+            ext = "pdf"
             source_id = f"{source_host}_{hashlib.sha256(original_url.encode()).hexdigest()[:12]}"
-            safe_name = Path(file_path).name
-            upload_meta = self.storage.upload_binary(source_id, snapshot_ts, safe_name, file_path)
-
-            # minimal manifest (idempotent)
-            minimal_manifest = {
-                "file_hash": raw_sha,
-                "mime_ext": "pdf",
-                "original_url": original_url,
-                "timestamp": iso_ts()
-            }
-            manifest_validator_minimal(minimal_manifest)
-            manifest_path = self.storage.write_manifest(source_id, snapshot_ts, safe_name, minimal_manifest)
+            upload_meta = self.storage.upload_binary_by_hash(source_id, raw_sha, ext, file_path)
+            minimal_manifest = {"file_hash": raw_sha, "mime_ext": ext, "original_url": original_url, "timestamp": iso_ts()}
+            manifest_path = self.storage.write_latest_manifest(source_id, hashlib.sha256(_canonicalize_url(original_url).encode()).hexdigest(), minimal_manifest)
             self.metrics["manifests_written"] += 1
             self.metrics["bytes_ingested"] += size_bytes
-
-            jlog("info", "captured_pdf_committed", url=original_url, file_path=upload_meta.get("storage_url"), manifest_path=manifest_path, sha256=raw_sha)
+            jlog("captured_pdf_committed", url=original_url, file_path=upload_meta.get("storage_url"), manifest_path=manifest_path, sha256=raw_sha)
             return {"manifest_path": manifest_path, "upload_meta": upload_meta, "minimal_manifest": minimal_manifest}
         except Exception as e:
-            jlog("error", "emit_pdf_manifest_failed", url=original_url, error=str(e))
+            jlog("emit_pdf_manifest_failed", url=original_url, error=str(e))
             return None
-
-    def _call_api_and_harvest(self, api_url: str, parent_url: str) -> List[str]:
-        results: List[str] = []
-        try:
-            r = self.http.get(api_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": HTTP_USER_AGENT})
-            if r.status_code != 200:
-                return results
-            ct = (r.headers.get("content-type") or "").lower()
-            if "application/json" in ct or api_url.lower().endswith(".json"):
-                try:
-                    j = r.json()
-                except Exception:
-                    try:
-                        j = json.loads(r.text)
-                    except Exception:
-                        j = None
-                def scan(obj):
-                    if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            scan(v)
-                    elif isinstance(obj, list):
-                        for it in obj:
-                            scan(it)
-                    elif isinstance(obj, str):
-                        s = obj.strip()
-                        if s.startswith("http"):
-                            if is_allowed_domain(s):
-                                results.append(s)
-                        else:
-                            if any(p in s for p in (".pdf", "/documents/", "/uploads/")):
-                                full = urljoin(api_url, s)
-                                if is_allowed_domain(full):
-                                    results.append(full)
-                scan(j)
-            else:
-                for m in self.url_regex.finditer(r.text):
-                    u = m.group(1)
-                    full = urljoin(api_url, u)
-                    if is_allowed_domain(full):
-                        results.append(full)
-        except Exception as e:
-            jlog("warn", "api_harvest_failed", api_url=api_url, error=str(e))
-        return list(dict.fromkeys(results))
 
     def _process_fetch(self, url: str, depth: int = 0, parent: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
         if self._time_exceeded():
@@ -658,197 +465,127 @@ class WebScraper:
         if self._seen_and_record(canonical):
             return {"url": url, "skipped": True}
         if not is_allowed_domain(url):
-            jlog("warn", "domain_not_allowed", url=url)
+            jlog("domain_not_allowed", url=url)
             return {"url": url, "error": "domain_not_allowed"}
+        doc_id = hashlib.sha256(canonical.encode()).hexdigest()
+        source_host = (urlparse(url).hostname or "unknown")
+        preexist = self.storage.manifest_exists_latest(f"{source_host}_{doc_id[:12]}", doc_id)
+        if preexist and not force:
+            jlog("skip_existing_latest_manifest", url=canonical, doc_id=doc_id, manifest=preexist)
+            return {"url": url, "skipped": True}
         if not self.robots.allowed(url):
-            jlog("warn", "robots_disallowed", url=url)
+            jlog("robots_disallowed", url=url)
             return {"url": url, "error": "robots_disallow"}
         self._enforce_crawl_delay(url)
-        source_id = f"{(urlparse(url).hostname or 'unknown')}_{hashlib.sha256(url.encode()).hexdigest()[:12]}"
-
         head_status, head_headers = self._head(url)
         head_etag = (head_headers or {}).get("etag") if head_headers else None
         head_lastmod = (head_headers or {}).get("last-modified") if head_headers else None
-
-        attempts_meta: List[Dict[str, Any]] = []
+        attempts_meta = []
         attempt = 0
         last_exc = None
         prefer_browser = False
         try:
             host = urlparse(url).hostname or ""
             if host and any(host.endswith(d) for d in ALLOWED_DOMAINS):
-                prefer_browser = True
+                prefer_browser = False
         except Exception:
             prefer_browser = False
-
         while attempt <= HTTP_RETRIES:
             if self._time_exceeded():
                 return {"url": url, "error": "time_exceeded"}
             attempt += 1
             start_at = datetime.now(timezone.utc)
             tmpf_path = None
-            captured_network_files: List[Dict[str, Any]] = []
+            captured_network_files = []
             try:
                 get_headers = {"User-Agent": HTTP_USER_AGENT}
                 if head_etag:
                     get_headers["If-None-Match"] = head_etag
                 if head_lastmod:
                     get_headers["If-Modified-Since"] = head_lastmod
-
-                use_browser = False
-                if prefer_browser and _HAS_PLAYWRIGHT:
-                    use_browser = True
-
-                if use_browser:
-                    status, headers, tmpf_path, final_url, captured_network_files = self._browser_fetch_to_file(url)
-                    self.metrics["browser_captures"] += len([c for c in captured_network_files if c.get("type") == "pdf"])
-                else:
-                    status, headers, tmpf_path, final_url, captured_network_files = self._static_fetch_to_file(url, headers=get_headers)
-
+                status, headers, tmpf_path, final_url, captured_network_files = self._static_fetch_to_file(url, headers=get_headers)
                 if status == 304:
-                    jlog("info", "not_modified", url=url)
+                    jlog("not_modified", url=url)
                     try:
                         if tmpf_path and os.path.exists(tmpf_path):
                             os.unlink(tmpf_path)
                     except Exception:
                         pass
                     return {"url": url, "skipped": True}
-
                 raw_sha256 = _compute_sha256_file(tmpf_path)
+                if raw_sha256 in self.seen_hashes:
+                    try:
+                        if tmpf_path and os.path.exists(tmpf_path):
+                            os.unlink(tmpf_path)
+                    except Exception:
+                        pass
+                    jlog("duplicate_in_run_skipped", url=url, sha256=raw_sha256)
+                    return {"url": url, "skipped": True}
+                self.seen_hashes.add(raw_sha256)
                 size_bytes = os.path.getsize(tmpf_path)
                 attempts_meta.append({"started_at": start_at.isoformat().replace("+00:00", "Z"), "finished_at": iso_ts(), "status_code": status, "bytes_received": size_bytes, "error": None})
                 ext = _ext_from_url_or_ct(final_url, headers.get("content-type"))
                 safe_name = _safe_name_from_url(final_url, ext)
-                snapshot_ts = _now_snapshot_ts()
-
-                # handle captured network files first (pdfs/json)
-                if captured_network_files:
-                    for item in captured_network_files:
-                        if item.get("type") == "pdf" and item.get("path"):
-                            host = urlparse(item.get("url") or url).hostname or "unknown"
-                            self._emit_pdf_manifest(host, item.get("path"), item.get("url") or url)
-                    api_candidates = []
-                    for item in captured_network_files:
-                        if item.get("type") == "json" and item.get("text"):
-                            try:
-                                j = json.loads(item.get("text"))
-                                def scan(o):
-                                    if isinstance(o, dict):
-                                        for k, v in o.items():
-                                            scan(v)
-                                    elif isinstance(o, list):
-                                        for it in o:
-                                            scan(it)
-                                    elif isinstance(o, str):
-                                        s = o.strip()
-                                        if s.startswith("http"):
-                                            if is_allowed_domain(s):
-                                                api_candidates.append(s)
-                                        else:
-                                            if any(p in s for p in (".pdf", "/documents/", "/uploads/")):
-                                                api_candidates.append(urljoin(final_url, s))
-                                scan(j)
-                            except Exception:
-                                for m in self.url_regex.finditer(item.get("text") or ""):
-                                    api_candidates.append(urljoin(final_url, m.group(1)))
-                    for api in list(dict.fromkeys(api_candidates)):
-                        docs = self._call_api_and_harvest(api, final_url)
-                        for d in docs:
-                            try:
-                                st, hdrs, tmpf2, final_doc, _ = self._static_fetch_to_file(d)
-                                if os.path.exists(tmpf2) and os.path.getsize(tmpf2) > 512:
-                                    host = urlparse(d).hostname or "unknown"
-                                    self._emit_pdf_manifest(host, tmpf2, d)
-                                else:
-                                    try: os.unlink(tmpf2)
-                                    except Exception: pass
-                            except Exception:
-                                continue
-
-                # upload main fetch
-                upload_meta = self.storage.upload_binary(source_id, snapshot_ts, safe_name, tmpf_path)
-
-                # minimal manifest written to RAW_PREFIX only (idempotent)
-                minimal_manifest = {
-                    "file_hash": raw_sha256,
-                    "mime_ext": ext or "",
-                    "original_url": final_url,
-                    "timestamp": iso_ts()
-                }
+                upload_meta = self.storage.upload_binary_by_hash(f"{source_host}_{doc_id[:12]}", raw_sha256, ext, tmpf_path)
+                minimal_manifest = {"file_hash": raw_sha256, "mime_ext": ext or "", "original_url": final_url, "timestamp": iso_ts()}
                 try:
                     manifest_validator_minimal(minimal_manifest)
                 except Exception as e:
-                    jlog("warn", "manifest_validation_failed", url=final_url, error=str(e))
-                manifest_path = self.storage.write_manifest(source_id, snapshot_ts, safe_name, minimal_manifest)
-
-                # determine page role and harvest links if HTML
-                page_role = "unknown"
-                candidate_links: List[str] = []
+                    jlog("manifest_validation_failed", url=final_url, error=str(e))
+                manifest_path = self.storage.write_latest_manifest(f"{source_host}_{doc_id[:12]}", doc_id, minimal_manifest)
+                self.metrics["fetch_success"] += 1
+                self.metrics["bytes_ingested"] += upload_meta.get("size_bytes", 0) or 0
+                self.metrics["manifests_written"] += 1
+                candidate_links = []
                 ct = headers.get("content-type") if headers else ""
                 is_html = ("text/html" in (ct or "")) or safe_name.lower().endswith((".html", ".htm", "response.html"))
                 if is_html:
-                    links = self._extract_links_from_html(tmpf_path, final_url)
                     try:
+                        with open(tmpf_path, "rb") as fh:
+                            text = fh.read().decode(errors="replace")
                         extractor = SimpleHTMLExtractor(final_url)
-                        extractor.feed(open(tmpf_path,"rb").read().decode(errors="replace"))
+                        extractor.feed(text)
                         ld = extractor.link_density()
                         txt_words = len(extractor.text().split())
-                    except Exception:
-                        ld = 0.0
-                        txt_words = 0
-                    if size_bytes >= MIN_HTML_BYTES and txt_words >= MIN_CONTENT_WORDS and ld <= 1.5:
-                        page_role = "content"
-                    else:
-                        page_role = "index"
-                    for link in links:
-                        href = link.get("href") or ""
-                        anchor_text = link.get("text") or ""
-                        attrs = link.get("attrs") or {}
-                        if not href:
-                            continue
-                        if not is_allowed_domain(href):
-                            continue
-                        if anchor_implies_document(href, anchor_text, attrs):
-                            candidate_links.append(_canonicalize_url(href))
+                        links = extractor.links[:400]
+                        if size_bytes >= MIN_HTML_BYTES and txt_words >= MIN_CONTENT_WORDS and ld <= 1.5:
+                            page_role = "content"
                         else:
-                            if any(k in (anchor_text or "").lower() for k in ("scheme","eligibility","apply","how to","guidelines","notice")):
+                            page_role = "index"
+                        for link in links:
+                            href = link.get("href") or ""
+                            anchor_text = link.get("text") or ""
+                            attrs = link.get("attrs") or {}
+                            if not href:
+                                continue
+                            if not is_allowed_domain(href):
+                                continue
+                            if anchor_implies_document(href, anchor_text, attrs):
                                 candidate_links.append(_canonicalize_url(href))
-                    try:
-                        with open(tmpf_path,"rb") as fh:
-                            text = fh.read().decode(errors="replace")
+                            else:
+                                if any(k in (anchor_text or "").lower() for k in ("scheme","eligibility","apply","how to","guidelines","notice")):
+                                    candidate_links.append(_canonicalize_url(href))
                         for m in self.api_url_regex.finditer(text):
                             candidate_links.append(urljoin(final_url, m.group(1)))
                         for m in self.url_regex.finditer(text):
                             candidate_links.append(urljoin(final_url, m.group(1)))
                     except Exception:
                         pass
-
-                # update metrics and logging (manifest written is minimal)
-                self.metrics["fetch_success"] += 1
-                self.metrics["bytes_ingested"] += upload_meta.get("size_bytes", 0) or 0
-                self.metrics["manifests_written"] += 1
-                self.metrics["links_harvested"] += len(candidate_links)
-
-                jlog("info", "fetch_and_commit_success", url=url, file_path=upload_meta.get("storage_url"), manifest_path=manifest_path, sha256=raw_sha256, page_role=page_role, links=len(candidate_links))
-
-                # cleanup local temp file
+                jlog("fetch_and_commit_success", url=url, file_path=upload_meta.get("storage_url"), manifest_path=manifest_path, sha256=raw_sha256, links=len(candidate_links))
                 try:
                     if tmpf_path and os.path.exists(tmpf_path):
                         os.unlink(tmpf_path)
                 except Exception:
                     pass
-
-                # build discovery lists
                 prioritized = []
                 next_discovery = []
                 for l in candidate_links:
                     if any(l.lower().endswith("." + e) for e in ALLOWED_EXTENSIONS) or any(p in l.lower() for p in ("/documents/","/uploads/","/files/")) or "file=" in l.lower():
-                        prioritized.append(WorkItem(l, depth + 1, 5, parent=url, is_doc=True))
+                        prioritized.append(l)
                     else:
                         if depth + 1 <= MAX_CRAWL_DEPTH:
-                            next_discovery.append(WorkItem(l, depth + 1, 60, parent=url, is_doc=False))
-                return {"manifest": minimal_manifest, "links": [w.url for w in prioritized + next_discovery]}
-
+                            next_discovery.append(l)
+                return {"manifest": minimal_manifest, "links": prioritized + next_discovery}
             except Exception as e:
                 last_exc = e
                 try:
@@ -858,63 +595,97 @@ class WebScraper:
                     pass
                 backoff_sleep(HTTP_BACKOFF, attempt)
                 self.metrics["fetch_failures"] += 1
-                jlog("warn", "fetch_attempt_exception", url=url, attempt=attempt, error=str(e))
+                jlog("fetch_attempt_exception", url=url, attempt=attempt, error=str(e))
                 continue
-
-        jlog("error", "fetch_failed_all_attempts", url=url, error=str(last_exc))
+        jlog("fetch_failed_all_attempts", url=url, error=str(last_exc))
         return {"url": url, "error": str(last_exc) if last_exc else "fetch_failed"}
 
     def run(self, seeds: List[str]) -> None:
-        prioritized_docs: List[WorkItem] = []
-        discovery_queue: List[WorkItem] = []
+        prioritized_docs = []
+        discovery_queue = []
         for s in seeds:
-            discovery_queue.append(WorkItem(s, 0, 50, parent=None, is_doc=False))
+            discovery_queue.append((s, 0))
         with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
             futures = {}
             while (discovery_queue or prioritized_docs) and not self._time_exceeded():
                 while prioritized_docs and len(futures) < CONCURRENT_WORKERS:
-                    item = prioritized_docs.pop(0)
-                    futures[ex.submit(self._process_fetch, item.url, item.depth, item.parent)] = item
+                    url, depth = prioritized_docs.pop(0)
+                    futures[ex.submit(self._process_fetch, url, depth, None)] = (url, depth)
                 while discovery_queue and len(futures) < CONCURRENT_WORKERS:
-                    item = discovery_queue.pop(0)
-                    futures[ex.submit(self._process_fetch, item.url, item.depth, item.parent)] = item
+                    url, depth = discovery_queue.pop(0)
+                    futures[ex.submit(self._process_fetch, url, depth, None)] = (url, depth)
                 if not futures:
                     break
                 for fut in list(futures):
                     if fut.done():
-                        item = futures.pop(fut)
+                        url, depth = futures.pop(fut)
                         try:
                             res = fut.result()
                         except Exception as e:
-                            jlog("error", "worker_exception", url=item.url, error=str(e))
+                            jlog("worker_exception", url=url, error=str(e))
                             continue
                         if isinstance(res, dict) and res.get("links"):
-                            links = res["links"]
-                            for l in links:
+                            for l in res["links"]:
                                 if not l:
                                     continue
                                 if any(l.lower().endswith("." + e) for e in ALLOWED_EXTENSIONS) or any(p in l.lower() for p in ("/documents/","/uploads/","/files/")):
-                                    prioritized_docs.append(WorkItem(l, item.depth + 1, 5, parent=item.url, is_doc=True))
+                                    prioritized_docs.append((l, depth + 1))
                                 else:
-                                    if item.depth + 1 <= MAX_CRAWL_DEPTH:
-                                        discovery_queue.append(WorkItem(l, item.depth + 1, 60, parent=item.url, is_doc=False))
-            jlog("info", "pipeline_complete", metrics=self.metrics, elapsed_seconds=int(time.time()-self.start_time))
+                                    if depth + 1 <= MAX_CRAWL_DEPTH:
+                                        discovery_queue.append((l, depth + 1))
+            jlog("pipeline_complete", metrics=self.metrics, elapsed_seconds=int(time.time()-self.start_time))
+
+def manifest_validator_minimal(man: Dict[str, Any]) -> None:
+    required = ["file_hash", "mime_ext", "original_url", "timestamp"]
+    missing = [k for k in required if k not in man]
+    if missing:
+        raise ValueError(f"manifest missing required fields: {missing}")
+    if not isinstance(man.get("file_hash"), str) or len(man.get("file_hash", "")) < 8:
+        raise ValueError("invalid file_hash")
+    try:
+        _ = datetime.fromisoformat(man["timestamp"].replace("Z", "+00:00"))
+    except Exception:
+        raise ValueError("timestamp not ISO8601")
+
+def anchor_implies_document(href: str, anchor_text: str, attrs: Dict[str, str]) -> bool:
+    txt = (anchor_text or "").lower()
+    for kw in ("download", "pdf", "guideline", "application", "form", "gazette", "notification", "circular"):
+        if kw in txt:
+            return True
+    href_l = (href or "").lower()
+    if any(p in href_l for p in ("/documents/", "/uploads/", "/files/", "/pdf", "/download", "attachment")):
+        return True
+    if any(href_l.endswith("." + e) for e in ALLOWED_EXTENSIONS):
+        return True
+    return False
+
+def is_allowed_domain(url: str) -> bool:
+    if not ALLOWED_DOMAINS:
+        return True
+    try:
+        host = urlparse(url).hostname or ""
+        for allowed in ALLOWED_DOMAINS:
+            if host.endswith(allowed):
+                return True
+        return False
+    except Exception:
+        return False
 
 def main() -> int:
     storage = StorageClient(s3_bucket=S3_BUCKET, aws_region=AWS_REGION)
     if S3_BUCKET and not storage.preflight_s3_access():
-        jlog("error", "s3_preflight_failed", bucket=S3_BUCKET)
+        jlog("s3_preflight_failed", bucket=S3_BUCKET)
         return 2
     scraper = WebScraper(storage=storage)
-    jlog("info", "starting_scraper", seeds=len(SEED_URLS), allowed_domains=ALLOWED_DOMAINS, use_browser=bool(scraper.browser))
+    jlog("starting_scraper", seeds=len(SEED_URLS), allowed_domains=ALLOWED_DOMAINS, use_browser=bool(scraper.browser))
     scraper.run(SEED_URLS)
-    jlog("info", "exiting_scraper", metrics=scraper.metrics)
+    jlog("exiting_scraper", metrics=scraper.metrics)
     return 0
 
 if __name__ == "__main__":
     try:
         rc = main()
     except Exception as e:
-        jlog("error", "unhandled_exception", error=str(e))
+        jlog("unhandled_exception", error=str(e))
         rc = 1
     sys.exit(rc)
