@@ -1,4 +1,3 @@
-# indexing_pipeline/Dockerfile
 # Build-time args:
 #   OCR_LANGUAGES  - comma-separated list (default "eng,tam,hin")
 #   INDIC_OCR_SIZE - best|standard|fast (default "best")
