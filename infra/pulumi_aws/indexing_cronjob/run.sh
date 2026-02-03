@@ -13,6 +13,7 @@ MODE="${1:-}"
   exit 2
 }
 
+
 export AWS_REGION="${AWS_REGION:-ap-south-1}"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
@@ -84,9 +85,8 @@ ensure_ddb_table() {
 create_venv() {
   if [ ! -d "$VENV_DIR" ]; then
     log "venv: creating at $VENV_DIR"
-    python3 -m venv "$VENV_DIR"
+    python3 -m venv "$VENV_DIR" && $VENV_DIR/bin/python -m pip install 'pip<26'
   fi
-  "$VENV_DIR/bin/python" -m pip install -q --upgrade pip setuptools wheel
   if [ -f "$REQ_FILE" ]; then
     "$VENV_DIR/bin/python" -m pip install -q -r "$REQ_FILE"
   else
@@ -110,6 +110,7 @@ YAML
 }
 
 pulumi_up() {
+  pulumi config set indexing-cronjob:image_uri athithya5354/civic-indexing:latest
   pulumi up --yes
 }
 

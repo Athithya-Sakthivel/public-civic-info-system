@@ -103,5 +103,12 @@ ELT:
 push-indexing-image:
 	bash indexing_pipeline/build_and_push_image.sh
 
+delete-pulumi-indexing-cronjob:
+	bash infra/pulumi_aws/indexing_cronjob/run.sh create
 pulumi-indexing-cronjob:
 	bash infra/pulumi_aws/indexing_cronjob/run.sh create
+
+pi:
+	git add indexing_pipeline
+	git commit -m "indexing pipeline update"
+	git push origin main

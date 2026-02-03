@@ -1,3 +1,4 @@
 encryptionsalt: v1:Yc3HVDkHTY4=:v1:/BSHP2ww109bCIyB:wWkgCUgwnHfiNUZdcgtvltWAAfhG9A==
 config:
   aws:region: ap-south-1
+  indexing-cronjob:image_uri: athithya5354/civic-indexing:latest
