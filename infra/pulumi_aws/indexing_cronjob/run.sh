@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+set -euo pipefail
 IFS=$'\n\t'
 
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then
@@ -8,12 +8,15 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
 fi
 
 MODE="${1:-}"
-[ "$MODE" = "create" ] || [ "$MODE" = "delete" ] || {
+if [ "$MODE" != "create" ] && [ "$MODE" != "delete" ]; then
   echo "usage: $0 create|delete" >&2
   exit 2
-}
+fi
 
+log(){ printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
 
+# --- env / defaults ---
 export AWS_REGION="${AWS_REGION:-ap-south-1}"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
@@ -36,15 +39,14 @@ export PULUMI_PYTHON_CMD="${VENV_DIR}/bin/python"
 export AWS_DYNAMODB_LOCK_TABLE="$DDB_TABLE"
 export AWS_SDK_LOAD_CONFIG=1
 
-log(){ printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*"; }
-die(){ echo "ERROR: $*" >&2; exit 1; }
-
+# --- fast checks ---
 for c in aws pulumi python3 jq; do
   command -v "$c" >/dev/null 2>&1 || die "missing dependency: $c"
 done
 
 aws sts get-caller-identity >/dev/null 2>&1 || die "AWS credentials not working"
 
+# --- helpers ---
 ensure_bucket() {
   log "s3: ensure bucket ${PULUMI_STATE_BUCKET}"
   if aws s3api head-bucket --bucket "$PULUMI_STATE_BUCKET" >/dev/null 2>&1; then
@@ -58,6 +60,7 @@ ensure_bucket() {
         --create-bucket-configuration LocationConstraint="$AWS_REGION" >/dev/null
     fi
     aws s3api wait bucket-exists --bucket "$PULUMI_STATE_BUCKET"
+    log "s3: bucket created"
   fi
   aws s3api put-bucket-versioning \
     --bucket "$PULUMI_STATE_BUCKET" \
@@ -75,21 +78,24 @@ ensure_ddb_table() {
     --attribute-definitions AttributeName=LockID,AttributeType=S \
     --key-schema AttributeName=LockID,KeyType=HASH \
     --billing-mode PAY_PER_REQUEST \
-    --region "$AWS_REGION" >/dev/null 2>&1 || true
-  aws dynamodb wait table-exists \
-    --table-name "$DDB_TABLE" \
-    --region "$AWS_REGION"
+    --region "$AWS_REGION" >/dev/null 2>&1
+  aws dynamodb wait table-exists --table-name "$DDB_TABLE" --region "$AWS_REGION"
   log "ddb: table ready"
 }
 
-create_venv() {
+create_venv_and_install() {
   if [ ! -d "$VENV_DIR" ]; then
     log "venv: creating at $VENV_DIR"
-    python3 -m venv "$VENV_DIR" && $VENV_DIR/bin/python -m pip install 'pip<26'
+    python3 -m venv "$VENV_DIR"
+    # ensure pip compatible with pinned pulumi
+    "$VENV_DIR/bin/python" -m pip install --upgrade "pip<26"
   fi
+
   if [ -f "$REQ_FILE" ]; then
+    log "venv: installing $REQ_FILE"
     "$VENV_DIR/bin/python" -m pip install -q -r "$REQ_FILE"
   else
+    log "venv: installing minimal pulumi deps"
     "$VENV_DIR/bin/python" -m pip install -q pulumi pulumi-aws boto3
   fi
 }
@@ -102,34 +108,42 @@ name: indexing-cronjob
 runtime: python
 YAML
   fi
+
   pulumi login "$PULUMI_LOGIN_URL" >/dev/null
-  if ! pulumi stack select "$STACK" >/dev/null 2>&1; then
+  if pulumi stack select "$STACK" >/dev/null 2>&1; then
+    log "pulumi: selected existing stack $STACK"
+  else
+    log "pulumi: initializing stack $STACK"
     pulumi stack init "$STACK" >/dev/null
   fi
   pulumi config set aws:region "$AWS_REGION" --non-interactive >/dev/null
 }
 
-pulumi_up() {
-  pulumi config set indexing-cronjob:image_uri athithya5354/civic-indexing:latest
-  pulumi up --yes
-}
-
-pulumi_destroy() {
-  if pulumi stack select "$STACK" >/dev/null 2>&1; then
-    pulumi destroy --yes || true
-    pulumi stack rm --yes || true
+pulumi_preview_and_up() {
+  # run preview; if preview exits non-zero, abort without changing infra
+  log "pulumi: running preview"
+  if pulumi preview --stack "$STACK" --non-interactive; then
+    log "pulumi: preview succeeded, proceeding to up"
+    pulumi up --yes --stack "$STACK"
+  else
+    die "pulumi preview failed; aborting. Fix issues and retry."
   fi
 }
 
-delete_ddb() {
-  if aws dynamodb describe-table --table-name "$DDB_TABLE" >/dev/null 2>&1; then
-    aws dynamodb delete-table --table-name "$DDB_TABLE" >/dev/null
-    aws dynamodb wait table-not-exists --table-name "$DDB_TABLE" || true
+pulumi_destroy_only() {
+  # Select stack; if not present, nothing to do
+  cd "$PROJECT_DIR"
+  if pulumi stack select "$STACK" >/dev/null 2>&1; then
+    log "pulumi: destroying stack $STACK"
+    pulumi destroy --yes --stack "$STACK" || log "pulumi: destroy returned non-zero, continuing cleanup"
+    pulumi stack rm --yes "$STACK" || log "pulumi: stack rm returned non-zero"
+  else
+    log "pulumi: stack $STACK not found; skipping destroy"
   fi
 }
 
 delete_s3_prefix() {
-  log "s3: deleting pulumi state prefix"
+  log "s3: deleting pulumi state prefix ${PULUMI_STATE_PREFIX}"
   while :; do
     objs="$(aws s3api list-object-versions \
       --bucket "$PULUMI_STATE_BUCKET" \
@@ -142,21 +156,37 @@ delete_s3_prefix() {
   done
 }
 
-log "project=$PROJECT_DIR stack=$STACK region=$AWS_REGION"
+delete_ddb_table() {
+  if aws dynamodb describe-table --table-name "$DDB_TABLE" >/dev/null 2>&1; then
+    aws dynamodb delete-table --table-name "$DDB_TABLE" >/dev/null
+    aws dynamodb wait table-not-exists --table-name "$DDB_TABLE" --region "$AWS_REGION" || true
+    log "ddb: deleted $DDB_TABLE"
+  else
+    log "ddb: table $DDB_TABLE not present"
+  fi
+}
 
+# --- main branching; strictly separate flows ---
 if [ "$MODE" = "create" ]; then
+  log "mode=create"
   ensure_bucket
   ensure_ddb_table
-  create_venv
+  create_venv_and_install
   pulumi_prepare
-  pulumi_up
+  pulumi_preview_and_up
   log "CREATE complete"
+  exit 0
 fi
 
 if [ "$MODE" = "delete" ]; then
-  pulumi_prepare || true
-  pulumi_destroy
+  log "mode=delete"
+  # pulumi_prepare used only to select login and stack where necessary
+  cd "$PROJECT_DIR"
+  pulumi login "$PULUMI_LOGIN_URL" >/dev/null
+  pulumi_destroy_only
+  # cleanup backend artifacts
   delete_s3_prefix
-  delete_ddb
+  delete_ddb_table
   log "DELETE complete"
+  exit 0
 fi
