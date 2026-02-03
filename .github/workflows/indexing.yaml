@@ -1,0 +1,137 @@
+name: indexing-pipeline-ci-cd
+on:
+  push:
+    paths:
+      - 'indexing_pipeline/**'
+  pull_request:
+    paths:
+      - 'indexing_pipeline/**'
+  workflow_dispatch: {}
+
+env:
+  IMAGE_NAME: athithya5354/civic-indexing
+  IMAGE_TAG: latest
+  BUILD_CONTEXT: indexing_pipeline
+  DOCKERFILE_PATH: indexing_pipeline/Dockerfile
+  OCR_LANGUAGES: eng,tam,hin
+  INDIC_OCR_SIZE: best
+  PUSH: 'true'
+  ECR_REGISTRY: 'false'
+  ECR_REPO: civic-indexing
+  SMOKE_TEST: 'false'
+  SMOKE_TIMEOUT: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.S3_BUCKET }}
+      SEED_URLS: ${{ vars.SEED_URLS }}
+      ALLOWED_DOMAINS: ${{ vars.ALLOWED_DOMAINS }}
+      IMAGE_NAME: ${{ env.IMAGE_NAME }}
+      IMAGE_TAG: ${{ env.IMAGE_TAG }}
+      OCR_LANGUAGES: ${{ env.OCR_LANGUAGES }}
+      INDIC_OCR_SIZE: ${{ env.INDIC_OCR_SIZE }}
+      PUSH: ${{ env.PUSH }}
+      ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+      ECR_REPO: ${{ env.ECR_REPO }}
+      SMOKE_TEST: ${{ env.SMOKE_TEST }}
+      SMOKE_TIMEOUT: ${{ env.SMOKE_TIMEOUT }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: validate-dockerfile-guardrails
+        run: |
+          set -euo pipefail
+          test -f "${{ env.DOCKERFILE_PATH }}" || (echo "[ERROR] Dockerfile missing at ${{ env.DOCKERFILE_PATH }}" && exit 1)
+          if grep -E -n "pip( |.*)install( |.*)awscli" "${{ env.DOCKERFILE_PATH }}" >/dev/null 2>&1; then
+            echo "[ERROR] Detected awscli being installed via pip in Dockerfile. Use AWS CLI v2 on runner or separate infra image."
+            exit 1
+          fi
+          echo "[INFO] Guardrails OK"
+
+      - name: set-up-qemu
+        uses: docker/setup-qemu-action@v2
+
+      - name: set-up-buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: build-image
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: ./indexing_pipeline
+          file: ./indexing_pipeline/Dockerfile
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            OCR_LANGUAGES=${{ env.OCR_LANGUAGES }}
+            INDIC_OCR_SIZE=${{ env.INDIC_OCR_SIZE }}
+
+      - name: optional-smoke-test
+        if: ${{ env.SMOKE_TEST == 'true' }}
+        run: |
+          set -euo pipefail
+          CONTAINER_NAME=ci-smoke-${{ env.IMAGE_NAME }}-$$
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+          docker run -d --name "$CONTAINER_NAME" --shm-size=1g "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" || (docker logs "$CONTAINER_NAME" || true; exit 1)
+          start_ts=$(date +%s)
+          ok=false
+          while :; do
+            state=$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || echo false)
+            if [ "$state" = "true" ]; then ok=true; break; fi
+            now=$(date +%s)
+            if [ $((now-start_ts)) -ge "${{ env.SMOKE_TIMEOUT }}" ]; then break; fi
+            sleep 1
+          done
+          if [ "$ok" != "true" ]; then docker logs --tail 200 "$CONTAINER_NAME" || true; docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true; echo "[ERROR] Smoke test failed: container did not remain running"; exit 1; fi
+          docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+          echo "[INFO] Smoke test passed: container started and stayed running"
+
+      - name: prepare-for-push-check
+        run: |
+          echo "[INFO] push=${{ env.PUSH }} ecr=${{ env.ECR_REGISTRY }} ref=${GITHUB_REF}"
+          if [ "${{ env.PUSH }}" != "true" ]; then echo "[INFO] PUSH disabled; stopping before registry push"; exit 0; fi
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/heads/release/*) echo "[INFO] publishing allowed from this branch";;
+            *) echo "[INFO] not on protected branch; skipping registry push"; exit 0;;
+          esac
+
+      - name: configure-aws-for-ecr
+        if: ${{ env.ECR_REGISTRY == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: push-to-ecr
+        if: ${{ env.ECR_REGISTRY == 'true' }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          test -n "$ACCOUNT_ID" || (echo "[ERROR] Unable to determine AWS account id" && exit 1)
+          REPO="${{ env.ECR_REPO }}"
+          aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1 || aws ecr create-repository --repository-name "$REPO"
+          ECR_URL="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          docker tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" "${ECR_URL}/${REPO}:${{ env.IMAGE_TAG }}"
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" | docker login --username AWS --password-stdin "${ECR_URL}"
+          docker push "${ECR_URL}/${REPO}:${{ env.IMAGE_TAG }}"
+          echo "[INFO] pushed ${ECR_URL}/${REPO}:${{ env.IMAGE_TAG }}"
+
+      - name: push-to-dockerhub
+        if: ${{ env.ECR_REGISTRY != 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then echo "[WARN] Docker Hub creds missing; skipping push" && exit 0; fi
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          TARGET="${{ secrets.DOCKER_USERNAME }}/${{ env.IMAGE_NAME#*/ }}:${{ env.IMAGE_TAG }}"
+          docker tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" "$TARGET"
+          docker push "$TARGET"
+          echo "[INFO] pushed $TARGET"

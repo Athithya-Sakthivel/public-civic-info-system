@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # scripts/build_and_push.sh
 # Build the indexing_pipeline Docker image and optionally push to Docker Hub or ECR.
-# This script uses environment variables (no CLI args).
-# Export or set the variables at top-level in CI or your shell.
+# Configure behaviour using environment variables (no CLI args).
 set -euo pipefail
 
 # -------------------------
-# CONFIGURATION (override these by exporting env vars)
+# Config (override via env)
 # -------------------------
 IMAGE_NAME="${IMAGE_NAME:-civic-indexing}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
@@ -14,43 +13,35 @@ BUILD_CONTEXT="${BUILD_CONTEXT:-./indexing_pipeline}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-${BUILD_CONTEXT}/Dockerfile}"
 IMAGE_LOCAL="${IMAGE_NAME}:${IMAGE_TAG}"
 
-# OCR build args
-OCR_LANGUAGES="${OCR_LANGUAGES:-eng,tam,hin}"       # comma-separated "eng,tam,hin"
-INDIC_OCR_SIZE="${INDIC_OCR_SIZE:-best}"    # best|standard|fast
+OCR_LANGUAGES="${OCR_LANGUAGES:-eng,tam,hin}"
+INDIC_OCR_SIZE="${INDIC_OCR_SIZE:-best}"
 
-# PUSH controls
-PUSH="${PUSH:-true}"                        # true|false
-ECR_REGISTRY="${ECR_REGISTRY:-false}"       # true => ECR, false => Docker Hub (if DOCKER_USERNAME set)
+PUSH="${PUSH:-true}"                    # true|false
+ECR_REGISTRY="${ECR_REGISTRY:-false}"   # true => push to ECR
 ECR_REPO="${ECR_REPO:-${IMAGE_NAME}}"
-AWS_REGION="${AWS_REGION:-}"                # required for ECR
+AWS_REGION="${AWS_REGION:-}"
 DOCKER_USERNAME="${DOCKER_USERNAME:-}"
 DOCKER_PASSWORD="${DOCKER_PASSWORD:-}"
 
-# Smoke test
-SMOKE_TEST="${SMOKE_TEST:-false}"           # runs container locally and checks health endpoint (optional)
+SMOKE_TEST="${SMOKE_TEST:-false}"
 HEALTH_PORT="${HEALTH_PORT:-8080}"
 CONTAINER_PORT="${CONTAINER_PORT:-8080}"
 HEALTH_PATH="${HEALTH_PATH:-/health}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-60}"
 
-# Retry config
 RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-3}"
 RETRY_DELAY="${RETRY_DELAY:-2}"
 
-# internal container name for smoke test
 CONTAINER_NAME="${CONTAINER_NAME:-build-smoke-${IMAGE_NAME//[^a-zA-Z0-9]/}_$$}"
 
 # -------------------------
-# HELPERS
+# Helpers
 # -------------------------
 log(){ printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
 warn(){ printf '\033[0;33m[WARN]\033[0m %s\n' "$*" >&2; }
 err(){ printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 
-normalize_bool(){
-  local v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
-  case "$v" in 1|true|yes|y) printf '%s' "true" ;; *) printf '%s' "false" ;; esac
-}
+normalize_bool(){ local v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"; case "$v" in 1|true|yes|y) echo true ;; *) echo false ;; esac; }
 PUSH="$(normalize_bool "${PUSH}")"
 ECR_REGISTRY="$(normalize_bool "${ECR_REGISTRY}")"
 SMOKE_TEST="$(normalize_bool "${SMOKE_TEST}")"
@@ -76,19 +67,12 @@ cleanup_container(){
 trap 'cleanup_container' EXIT
 
 # -------------------------
-# Preconditions & quick checks
+# Preconditions
 # -------------------------
-if ! command -v docker >/dev/null 2>&1; then
-  err "docker CLI not found; install docker"
-  exit 2
-fi
+if ! command -v docker >/dev/null 2>&1; then err "docker CLI not found"; exit 2; fi
+if [ ! -f "${DOCKERFILE_PATH}" ]; then err "Dockerfile not found at ${DOCKERFILE_PATH}"; exit 3; fi
 
-if [ ! -f "${DOCKERFILE_PATH}" ]; then
-  err "Dockerfile not found at ${DOCKERFILE_PATH}"
-  exit 3
-fi
-
-log "Building ${IMAGE_LOCAL} from context ${BUILD_CONTEXT}"
+log "Building ${IMAGE_LOCAL}"
 log "OCR_LANGUAGES=${OCR_LANGUAGES} INDIC_OCR_SIZE=${INDIC_OCR_SIZE}"
 log "PUSH=${PUSH} ECR_REGISTRY=${ECR_REGISTRY}"
 
@@ -135,7 +119,7 @@ fi
 
 # If not pushing, exit
 if [ "${PUSH}" != "true" ]; then
-  log "PUSH is false; build complete. Local image: ${IMAGE_LOCAL}"
+  log "PUSH is false; image is available locally as ${IMAGE_LOCAL}"
   exit 0
 fi
 
@@ -144,54 +128,40 @@ fi
 # -------------------------
 if [ "${ECR_REGISTRY}" = "true" ]; then
   if ! command -v aws >/dev/null 2>&1; then
-    err "aws CLI not found; required for ECR push"
-    exit 6
+    err "aws CLI not found; required for ECR push"; exit 6
   fi
-
   if [ -z "${AWS_REGION:-}" ]; then
     AWS_REGION="$(aws configure get region || true)"
-    if [ -z "${AWS_REGION}" ]; then
-      err "AWS_REGION is required for ECR push. Set AWS_REGION env var or configure aws CLI"
-      exit 7
-    fi
   fi
+  if [ -z "${AWS_REGION:-}" ]; then err "AWS_REGION required for ECR push"; exit 7; fi
 
-  # resolve account id
   AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
-  if [ -z "${AWS_ACCOUNT_ID}" ]; then
-    err "Unable to resolve AWS account id (STS failed). Ensure AWS credentials are configured."
-    exit 8
-  fi
+  if [ -z "${AWS_ACCOUNT_ID}" ]; then err "Unable to resolve AWS account id (STS failed)"; exit 8; fi
 
   ECR_REGISTRY_URL="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
   TARGET_IMAGE="${ECR_REGISTRY_URL}/${ECR_REPO}:${IMAGE_TAG}"
 
-  # create repository if missing
+  # create repository if missing (idempotent)
   if ! aws ecr describe-repositories --repository-names "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null 2>&1; then
-    log "ECR repo ${ECR_REPO} not found in ${AWS_REGION}; creating"
+    log "ECR repo ${ECR_REPO} not found; creating..."
     aws ecr create-repository --repository-name "${ECR_REPO}" --region "${AWS_REGION}" >/dev/null
   else
     log "ECR repo ${ECR_REPO} exists"
   fi
 
-  # login and push
   log "Logging into ECR ${ECR_REGISTRY_URL}"
-  aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY_URL}" \
-    || { err "docker login to ECR failed"; exit 9; }
+  aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY_URL}" || { err "docker login to ECR failed"; exit 9; }
 
   docker tag "${IMAGE_LOCAL}" "${TARGET_IMAGE}"
   log "Pushing ${TARGET_IMAGE}"
-  if ! retry_cmd docker push "${TARGET_IMAGE}"; then
-    err "docker push to ECR failed after ${RETRY_ATTEMPTS} attempts"
-    exit 10
-  fi
+  if ! retry_cmd docker push "${TARGET_IMAGE}"; then err "docker push to ECR failed"; exit 10; fi
 
   log "Push to ECR succeeded: ${TARGET_IMAGE}"
   exit 0
 fi
 
 # -------------------------
-# Push to Docker Hub (or generic Docker registry using DOCKER_USERNAME)
+# Push to Docker Hub (fallback)
 # -------------------------
 if [ -z "${DOCKER_USERNAME:-}" ]; then
   warn "DOCKER_USERNAME not set; skipping push. Local image: ${IMAGE_LOCAL}"
@@ -200,19 +170,15 @@ fi
 
 if [ -n "${DOCKER_PASSWORD:-}" ]; then
   log "Logging into Docker registry as ${DOCKER_USERNAME}"
-  printf '%s\n' "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin \
-    || { err "Docker login failed"; exit 11; }
+  printf '%s\n' "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin || { err "Docker login failed"; exit 11; }
 else
-  warn "DOCKER_PASSWORD not set; attempting push without login (may fail)"
+  warn "DOCKER_PASSWORD not set; attempting push without login may fail"
 fi
 
 TARGET_IMAGE="${DOCKER_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 docker tag "${IMAGE_LOCAL}" "${TARGET_IMAGE}"
 log "Pushing ${TARGET_IMAGE}"
-if ! retry_cmd docker push "${TARGET_IMAGE}"; then
-  err "docker push to Docker Hub failed after ${RETRY_ATTEMPTS} attempts"
-  exit 12
-fi
+if ! retry_cmd docker push "${TARGET_IMAGE}"; then err "docker push to Docker Hub failed"; exit 12; fi
 
 log "Push to Docker Hub succeeded: ${TARGET_IMAGE}"
 exit 0
