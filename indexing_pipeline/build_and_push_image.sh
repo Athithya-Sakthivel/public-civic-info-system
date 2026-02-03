@@ -4,9 +4,6 @@
 # Configure behaviour using environment variables (no CLI args).
 set -euo pipefail
 
-# -------------------------
-# Config (override via env)
-# -------------------------
 IMAGE_NAME="${IMAGE_NAME:-civic-indexing}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-./indexing_pipeline}"
