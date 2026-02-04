@@ -17,8 +17,7 @@ export AWS_REGION="${AWS_REGION:-ap-south-1}"
 export AWS_DEFAULT_REGION="$AWS_REGION"
 export FORCE_DELETE="${FORCE_DELETE:-0}"
 
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PROJECT_DIR="${PROJECT_DIR:-$ROOT_DIR}"
+PROJECT_DIR="infra/pulumi_aws"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/venv}"
 REQ_FILE="${REQ_FILE:-$PROJECT_DIR/requirements.txt}"
 export IMAGE_URI="${IMAGE_URI:-athithya5354/civic-indexing:latest}"
@@ -173,7 +172,6 @@ fi
 if [ "$MODE" = "delete" ]; then
   LOG "mode=delete"
   create_venv_if_missing
-  cd "$PROJECT_DIR"
   pulumi login "$PULUMI_LOGIN_URL" >/dev/null
   if pulumi stack select "$STACK" >/dev/null 2>&1; then
     LOG "pulumi: destroying stack $STACK"

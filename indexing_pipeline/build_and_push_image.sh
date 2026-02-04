@@ -13,7 +13,7 @@ OCR_LANGUAGES="${OCR_LANGUAGES:-eng,tam,hin}"
 INDIC_OCR_SIZE="${INDIC_OCR_SIZE:-best}"
 
 PUSH="${PUSH:-true}"                    # true|false
-ECR_REGISTRY="${ECR_REGISTRY:-false}"   # true => push ECR
+ECR_REGISTRY="${ECR_REGISTRY:-false}"   
 ECR_REPO="${ECR_REPO:-${IMAGE_NAME}}"
 AWS_REGION="${AWS_REGION:-ap-south-1}"
 DOCKER_USERNAME="${DOCKER_USERNAME:-}"

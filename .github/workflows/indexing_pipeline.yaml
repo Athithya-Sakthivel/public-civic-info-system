@@ -1,4 +1,5 @@
 name: indexing-pipeline-ci-cd
+
 on:
   push:
     paths:
@@ -9,21 +10,28 @@ on:
   workflow_dispatch: {}
 
 env:
+  # core
   PROJECT_PREFIX: civic-index
+  AWS_REGION: ap-south-1
 
+  # image / build
   IMAGE_REPO: civic-indexing
   IMAGE_TAG: amd64-arm64-v2
   PLATFORMS: linux/amd64,linux/arm64
   LOCAL_PLATFORM: linux/amd64
   NO_CACHE: '1'
 
-  PUSH: 'true'
-  REGISTRY_TYPE: dockerhub    # set to "ecr" to push to ECR
+  # publishing
+  PUSH: 'true'                # repo-level toggle; final decision also considers branch + PR
+  REGISTRY_TYPE: dockerhub    # "dockerhub" or "ecr"
+  ECR_REPO: civic-index-repo-22a524a
   PUSH_LATEST: 'false'
 
+  # build context
   BUILD_CONTEXT: indexing_pipeline
   DOCKERFILE_PATH: indexing_pipeline/Dockerfile
 
+  # pipeline config
   OCR_LANGUAGES: eng,tam,hin
   INDIC_OCR_SIZE: best
 
@@ -35,62 +43,75 @@ permissions:
 
 jobs:
   build-and-push:
+    # Environment must be configured in repo Settings > Environments > staging
+    # to inject environment-scoped secrets (DOCKER_USERNAME/DOCKER_PASSWORD or AWS_*).
     environment: staging
     runs-on: ubuntu-latest
     outputs:
       image_full: ${{ steps.compute.outputs.image_full }}
       tags: ${{ steps.compute.outputs.tags }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Basic env validation (fail fast)
+      - name: Validate env + Dockerfile (fail fast)
         run: |
           set -euo pipefail
-          test -n "${IMAGE_REPO}" || (echo "ERROR: IMAGE_REPO is required" && exit 1)
-          test -n "${IMAGE_TAG}" || (echo "ERROR: IMAGE_TAG is required" && exit 1)
-          if [ "${IMAGE_TAG}" = "latest" ]; then echo "ERROR: IMAGE_TAG must not be 'latest'. Use a versioned tag." && exit 1; fi
-          test -n "${PLATFORMS}" || (echo "ERROR: PLATFORMS is required" && exit 1)
-          test -n "${BUILD_CONTEXT}" || (echo "ERROR: BUILD_CONTEXT is required" && exit 1)
-          test -f "${DOCKERFILE_PATH}" || (echo "ERROR: DOCKERFILE_PATH missing or file not found: ${DOCKERFILE_PATH}" && exit 1)
-          echo "INFO: basic envs ok"
 
-      - name: Validate Dockerfile guardrails (fail on pip awscli)
-        run: |
-          set -euo pipefail
+          # basic presence
+          test -n "${IMAGE_REPO}" || (echo "ERROR: IMAGE_REPO must be set" && exit 1)
+          test -n "${IMAGE_TAG}" || (echo "ERROR: IMAGE_TAG must be set" && exit 1)
+          if [ "${IMAGE_TAG}" = "latest" ]; then
+            echo "ERROR: IMAGE_TAG must not be 'latest' (use versioned tag or git sha)" && exit 1
+          fi
+
+          test -n "${PLATFORMS}" || (echo "ERROR: PLATFORMS must be set" && exit 1)
+          test -n "${BUILD_CONTEXT}" || (echo "ERROR: BUILD_CONTEXT must be set" && exit 1)
+          test -f "${DOCKERFILE_PATH}" || (echo "ERROR: DOCKERFILE_PATH not found: ${DOCKERFILE_PATH}" && exit 1)
+
+          # registry type validation
+          if [ "${REGISTRY_TYPE}" != "dockerhub" ] && [ "${REGISTRY_TYPE}" != "ecr" ]; then
+            echo "ERROR: REGISTRY_TYPE must be 'dockerhub' or 'ecr'" && exit 1
+          fi
+
+          # guardrails for Dockerfile
           if grep -E -n "pip( |.*)install( |.*)awscli" "${DOCKERFILE_PATH}" >/dev/null 2>&1; then
-            echo "ERROR: awscli must not be installed via pip inside image; use runner AWS CLI v2 or a separate infra image." >&2
+            echo "ERROR: awscli must not be installed via pip inside image; use runner AWS CLI v2 or separate infra image." >&2
             exit 1
           fi
-          echo "INFO: Dockerfile guardrails OK"
 
-      - name: Decide push and registry mode
+          echo "INFO: basic validation passed"
+
+      - name: Decide push + registry (do_push, use_ecr)
         id: decide
         run: |
           set -euo pipefail
           DO_PUSH=false
           USE_ECR=false
-          if [ "${PUSH}" = "true" ]; then
+
+          # only push from main or release/* branches when PUSH=true
+          if [ "${PUSH}" = "true" ] && [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
             case "${GITHUB_REF}" in
               refs/heads/main|refs/heads/release/*) DO_PUSH=true ;;
               *) DO_PUSH=false ;;
             esac
           fi
+
           if [ "${REGISTRY_TYPE}" = "ecr" ]; then USE_ECR=true; fi
-          # never push from fork PRs
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then DO_PUSH=false; fi
+
           echo "do_push=${DO_PUSH}" >> "$GITHUB_OUTPUT"
           echo "use_ecr=${USE_ECR}" >> "$GITHUB_OUTPUT"
-          echo "decision:PUSH=${PUSH} event=${GITHUB_EVENT_NAME} branch=${GITHUB_REF} do_push=${DO_PUSH} use_ecr=${USE_ECR}" >&2
+          echo "INFO: decision do_push=${DO_PUSH} use_ecr=${USE_ECR}" >&2
 
-      - name: Set up QEMU
+      - name: Setup QEMU
         uses: docker/setup-qemu-action@v2
 
-      - name: Set up Docker Buildx
+      - name: Setup buildx
         uses: docker/setup-buildx-action@v2
 
-      - name: Configure AWS credentials (for ECR)
-        if: ${{ steps.decide.outputs.use_ecr == 'true' }}
+      - name: Configure AWS credentials (ECR only)
+        if: ${{ steps.decide.outputs.use_ecr == 'true' && steps.decide.outputs.do_push == 'true' }}
         uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -102,40 +123,47 @@ jobs:
         if: ${{ steps.decide.outputs.use_ecr == 'true' && steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
+          # small retry for transient STS failures
+          ACCOUNT_ID=""
           for i in 1 2 3; do
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
             if [ -n "$ACCOUNT_ID" ]; then break; fi
             sleep $((i * 2))
           done
-          test -n "$ACCOUNT_ID" || (echo "ERROR: unable to get aws account id" && exit 1)
+          test -n "$ACCOUNT_ID" || (echo "ERROR: unable to obtain AWS account id" && exit 1)
           ECR_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || aws ecr create-repository --repository-name "${ECR_REPO}"
           echo "ECR_URL=${ECR_URL}" >> "$GITHUB_OUTPUT"
-          echo "INFO: prepared ECR ${ECR_URL}" >&2
+          echo "INFO: ECR_URL=${ECR_URL}" >&2
 
-      - name: Compute image_full and tags (fail if required secrets missing)
+      - name: Compute image_full + tags (emit outputs)
         id: compute
         if: ${{ steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
+          # compute IMAGE_FULL
           if [ "${{ steps.decide.outputs.use_ecr }}" = "true" ]; then
             IMAGE_FULL="${{ steps.prepare-ecr.outputs.ECR_URL }}/${ECR_REPO}"
           else
+            # require dockerhub creds exist in environment secrets (environment: staging)
             if [ -z "${{ secrets.DOCKER_USERNAME }}" ]; then
-              echo "ERROR: secrets.DOCKER_USERNAME required for Docker Hub pushes" >&2
+              echo "ERROR: secrets.DOCKER_USERNAME missing (required for Docker Hub push)" >&2
               exit 1
             fi
             IMAGE_FULL="${{ secrets.DOCKER_USERNAME }}/${IMAGE_REPO}"
           fi
+
+          # tags: versioned + immutable sha; latest only if explicitly allowed
           TAGS="${IMAGE_FULL}:${IMAGE_TAG},${IMAGE_FULL}:${GITHUB_SHA}"
           if [ "${PUSH_LATEST}" = "true" ]; then
             TAGS="${TAGS},${IMAGE_FULL}:latest"
           fi
+
           echo "image_full=${IMAGE_FULL}" >> "$GITHUB_OUTPUT"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "Computed IMAGE_FULL=${IMAGE_FULL} TAGS=${TAGS}" >&2
+          echo "INFO: computed image_full=${IMAGE_FULL} tags=${TAGS}" >&2
 
-      - name: Check docker creds present (Docker Hub)
+      - name: Validate Docker Hub creds present (if applicable)
         if: ${{ steps.decide.outputs.use_ecr == 'false' && steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
@@ -143,14 +171,14 @@ jobs:
             echo "ERROR: Docker Hub credentials missing in environment secrets" >&2
             exit 1
           fi
-          echo "INFO: Docker Hub credentials appear present" >&2
+          echo "INFO: Docker Hub credentials appear present"
 
-      - name: Login to Docker Hub (if Docker Hub push)
+      - name: Docker Hub login (if applicable)
         if: ${{ steps.decide.outputs.use_ecr == 'false' && steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
-          echo "INFO: docker hub login success" >&2
+          echo "INFO: logged in to Docker Hub"
 
       - name: Build & push (multi-arch)
         if: ${{ steps.decide.outputs.do_push == 'true' }}
@@ -166,39 +194,46 @@ jobs:
             OCR_LANGUAGES=${{ env.OCR_LANGUAGES }}
             INDIC_OCR_SIZE=${{ env.INDIC_OCR_SIZE }}
 
-      - name: Inspect pushed manifest (confirm platforms, fail if mismatch)
+      - name: Install jq (for manifest inspection)
+        if: ${{ steps.decide.outputs.do_push == 'true' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Inspect pushed manifest & validate platforms
         if: ${{ steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
           IMAGE="${{ steps.compute.outputs.image_full }}:${IMAGE_TAG}"
           EXPECTED_COUNT=$(echo "${PLATFORMS}" | awk -F, '{print NF}')
-          RAW=$(docker buildx imagetools inspect "$IMAGE" --raw 2>/dev/null || docker manifest inspect "$IMAGE" 2>/dev/null || true)
-          if [ -z "$RAW" ]; then echo "ERROR: unable to fetch manifest for $IMAGE" >&2; exit 1; fi
-          COUNT=$(echo "$RAW" | python - <<'PY'
-import sys, json
-raw=sys.stdin.read()
-j=json.loads(raw)
-arches=set()
-if isinstance(j, dict) and 'manifests' in j:
-  for m in j['manifests']:
-    p=m.get('platform') or {}
-    a=p.get('architecture')
-    if a: arches.add(a)
-elif isinstance(j, list):
-  for e in j:
-    p=e.get('platform') or {}
-    a=p.get('architecture')
-    if a: arches.add(a)
-print(len(arches))
-PY
-)
-          if [ -z "$COUNT" ]; then echo "[ERROR] manifest parse returned empty" >&2; exit 1; fi
-          if [ "$COUNT" -lt "$EXPECTED_COUNT" ]; then
-            echo "[ERROR] manifest platforms mismatch: expected ${EXPECTED_COUNT}, got ${COUNT}" >&2
-            echo "$RAW" >&2
+          # try buildx imagetools, fall back to docker manifest inspect
+          MANIFEST_JSON=""
+          if docker buildx imagetools inspect "$IMAGE" --raw >/tmp/manifest.json 2>/dev/null; then
+            MANIFEST_JSON=/tmp/manifest.json
+          elif docker manifest inspect "$IMAGE" >/tmp/manifest.json 2>/dev/null; then
+            MANIFEST_JSON=/tmp/manifest.json
+          else
+            echo "ERROR: unable to fetch manifest for $IMAGE" >&2
             exit 1
           fi
-          echo "[INFO] manifest contains ${COUNT} platforms" >&2
+
+          # extract unique architectures robustly
+          ARCH_COUNT=$(jq -r '[ (.manifests[]?.platform.architecture // empty), (.[]?.platform.architecture // empty) ] | unique | length' "$MANIFEST_JSON" 2>/dev/null || true)
+          if [ -z "$ARCH_COUNT" ]; then
+            echo "ERROR: failed to parse manifest JSON for $IMAGE" >&2
+            cat "$MANIFEST_JSON" >&2 || true
+            exit 1
+          fi
+
+          if [ "$ARCH_COUNT" -lt "$EXPECTED_COUNT" ]; then
+            echo "ERROR: manifest platforms mismatch for $IMAGE: expected ${EXPECTED_COUNT}, got ${ARCH_COUNT}" >&2
+            echo "Manifest:" >&2
+            cat "$MANIFEST_JSON" >&2 || true
+            exit 1
+          fi
+
+          echo "INFO: manifest contains ${ARCH_COUNT} platforms as expected"
 
       - name: Build local image (load into daemon, single-arch)
         if: ${{ steps.decide.outputs.do_push == 'false' }}
@@ -232,6 +267,11 @@ PY
             if [ $((NOW-START)) -ge "${SMOKE_TIMEOUT}" ]; then break; fi
             sleep 1
           done
-          if [ "$OK" != "true" ]; then docker logs --tail 200 "$CN" || true; docker rm -f "$CN" >/dev/null 2>&1 || true; echo "[ERROR] Smoke test failed"; exit 1; fi
+          if [ "$OK" != "true" ]; then
+            docker logs --tail 200 "$CN" || true
+            docker rm -f "$CN" >/dev/null 2>&1 || true
+            echo "[ERROR] Smoke test failed" >&2
+            exit 1
+          fi
           docker rm -f "$CN" >/dev/null 2>&1 || true
-          echo "[INFO] Smoke test passed"
+          echo "INFO: Smoke test passed"
