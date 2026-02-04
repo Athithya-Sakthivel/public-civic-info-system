@@ -109,3 +109,8 @@ pi:
 	git add indexing_pipeline
 	git commit -m "indexing pipeline update"
 	git push origin main
+
+pci:
+	git add .github
+	git commit -m ".github/ files update"
+	git push origin main

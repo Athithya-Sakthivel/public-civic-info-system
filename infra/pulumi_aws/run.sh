@@ -18,7 +18,7 @@ export AWS_DEFAULT_REGION="$AWS_REGION"
 export FORCE_DELETE="${FORCE_DELETE:-0}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PROJECT_DIR="${PROJECT_DIR:-$ROOT_DIR/indexing_cronjob}"
+PROJECT_DIR="${PROJECT_DIR:-$ROOT_DIR}"
 VENV_DIR="${VENV_DIR:-$PROJECT_DIR/venv}"
 REQ_FILE="${REQ_FILE:-$PROJECT_DIR/requirements.txt}"
 export IMAGE_URI="${IMAGE_URI:-athithya5354/civic-indexing:latest}"
