@@ -10,22 +10,23 @@ on:
 
 env:
   PROJECT_PREFIX: civic-index
-  AWS_REGION: ap-south-1
 
   IMAGE_REPO: civic-indexing
   IMAGE_TAG: amd64-arm64-v2
   PLATFORMS: linux/amd64,linux/arm64
   LOCAL_PLATFORM: linux/amd64
   NO_CACHE: '1'
+
   PUSH: 'true'
-  ECR_REGISTRY: 'false'
-  ECR_REPO: civic-index-repo-22a524a
+  REGISTRY_TYPE: dockerhub
   PUSH_LATEST: 'false'
 
   BUILD_CONTEXT: indexing_pipeline
   DOCKERFILE_PATH: indexing_pipeline/Dockerfile
+
   OCR_LANGUAGES: eng,tam,hin
   INDIC_OCR_SIZE: best
+
   SMOKE_TEST: 'false'
   SMOKE_TIMEOUT: '60'
 
@@ -34,6 +35,7 @@ permissions:
 
 jobs:
   build-and-push:
+    environment: staging
     runs-on: ubuntu-latest
     outputs:
       image_full: ${{ steps.compute.outputs.image_full }}
@@ -75,9 +77,10 @@ jobs:
             esac
           fi
           if [ "${ECR_REGISTRY}" = "true" ]; then USE_ECR=true; fi
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then DO_PUSH=false; fi
           echo "do_push=${DO_PUSH}" >> "$GITHUB_OUTPUT"
           echo "use_ecr=${USE_ECR}" >> "$GITHUB_OUTPUT"
-          echo "decision:PUSH=${PUSH} branch=${GITHUB_REF} do_push=${DO_PUSH} use_ecr=${USE_ECR}" >&2
+          echo "decision:PUSH=${PUSH} event=${GITHUB_EVENT_NAME} branch=${GITHUB_REF} do_push=${DO_PUSH} use_ecr=${USE_ECR}" >&2
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -98,7 +101,11 @@ jobs:
         if: ${{ steps.decide.outputs.use_ecr == 'true' && steps.decide.outputs.do_push == 'true' }}
         run: |
           set -euo pipefail
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          for i in 1 2 3; do
+            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)
+            if [ -n "$ACCOUNT_ID" ]; then break; fi
+            sleep $((i * 2))
+          done
           test -n "$ACCOUNT_ID" || (echo "ERROR: unable to get aws account id" && exit 1)
           ECR_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           aws ecr describe-repositories --repository-names "${ECR_REPO}" >/dev/null 2>&1 || aws ecr create-repository --repository-name "${ECR_REPO}"
@@ -127,6 +134,16 @@ jobs:
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "Computed IMAGE_FULL=${IMAGE_FULL} TAGS=${TAGS}" >&2
 
+      - name: Check docker creds present (Docker Hub)
+        if: ${{ steps.decide.outputs.use_ecr == 'false' && steps.decide.outputs.do_push == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
+            echo "ERROR: Docker Hub credentials missing in environment secrets" >&2
+            exit 1
+          fi
+          echo "INFO: Docker Hub credentials appear present" >&2
+
       - name: Login to Docker Hub (if Docker Hub push)
         if: ${{ steps.decide.outputs.use_ecr == 'false' && steps.decide.outputs.do_push == 'true' }}
         run: |
@@ -153,19 +170,34 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="${{ steps.compute.outputs.image_full }}:${IMAGE_TAG}"
-          EXPECTED=$(echo "${PLATFORMS}" | awk -F, '{print NF}')
-          echo "[INFO] Inspecting pushed image manifest: $IMAGE (expecting ${EXPECTED} platforms)" >&2
+          EXPECTED_COUNT=$(echo "${PLATFORMS}" | awk -F, '{print NF}')
           RAW=$(docker buildx imagetools inspect "$IMAGE" --raw 2>/dev/null || docker manifest inspect "$IMAGE" 2>/dev/null || true)
-          echo "$RAW" | head -c 10000
-          COUNT=0
-          for p in $(echo "${PLATFORMS}" | tr ',' '\n'); do
-            arch=$(echo "$p" | awk -F/ '{print $2}')
-            if echo "$RAW" | grep -qE "${arch}"; then
-              COUNT=$((COUNT+1))
-            fi
-          done
-          if [ "$COUNT" -lt "$(echo "${PLATFORMS}" | awk -F, '{print NF}')" ]; then
-            echo "[ERROR] manifest platforms mismatch: expected $(echo "${PLATFORMS}" | awk -F, '{print NF}'), got ${COUNT}" >&2
+          if [ -z "$RAW" ]; then echo "ERROR: unable to fetch manifest for $IMAGE" >&2; exit 1; fi
+          python - <<'PY'
+import sys, json
+raw=sys.stdin.read()
+j=json.loads(raw)
+arches=set()
+if isinstance(j, dict) and 'manifests' in j:
+  for m in j['manifests']:
+    if 'platform' in m and 'architecture' in m['platform']:
+      arches.add(m['platform']['architecture'])
+elif isinstance(j, list):
+  for entry in j:
+    if 'platform' in entry and 'architecture' in entry['platform']:
+      arches.add(entry['platform']['architecture'])
+print(",".join(sorted(arches)))
+PY <<EOF
+$RAW
+EOF
+          COUNT=$(echo "$RAW" | python -c "import sys,json; j=json.load(sys.stdin); a=set(); 
+if isinstance(j, dict) and 'manifests' in j:
+  [a.add(m.get('platform',{}).get('architecture','')) for m in j['manifests']]
+else:
+  [a.add(e.get('platform',{}).get('architecture','')) for e in j if isinstance(e, dict)]
+print(len([x for x in a if x]))")
+          if [ "$COUNT" -lt "$EXPECTED_COUNT" ]; then
+            echo "[ERROR] manifest platforms mismatch: expected ${EXPECTED_COUNT}, got ${COUNT}" >&2
             echo "$RAW" >&2
             exit 1
           fi
