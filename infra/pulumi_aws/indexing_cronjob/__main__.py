@@ -1,22 +1,36 @@
+import os
+os.environ.setdefault("AWS_REGION", "ap-south-1")
+os.environ.setdefault("PROJECT_PREFIX", "civic-index")
+os.environ.setdefault("IMAGE_URI", "athithya5354/civic-indexing:latest")
+os.environ.setdefault("SINGLE_NAT", "true")
 import json
 import pulumi
-from pulumi import Config
 import pulumi_aws as aws
-import pulumi_awsx as awsx
 
-cfg = Config()
-project_prefix = cfg.get("prefix") or "civic-index"
-aws_region = aws.config.region or cfg.get("aws:region") or "ap-south-1"
+project_prefix = os.environ["PROJECT_PREFIX"]
+aws_region = os.environ.get("AWS_REGION", "ap-south-1")
+image_uri = os.environ.get("IMAGE_URI")
+schedule_expression = os.environ.get("SCHEDULE", "cron(0 3 * * ? *)")
+cpu = int(os.environ.get("CPU", "1024"))
+memory = int(os.environ.get("MEMORY", "2048"))
+container_name = os.environ.get("CONTAINER_NAME", "indexer")
+env_vars = {}
+env_json = os.environ.get("ENV_VARS", "{}")
+try:
+    env_vars = json.loads(env_json) if env_json else {}
+except Exception:
+    env_vars = {}
+retain_buckets = os.environ.get("RETAIN_BUCKETS", "false").lower() in ("1", "true", "yes")
+az_count = int(os.environ.get("AZ_COUNT", "2"))
 
-image_uri = cfg.require("image_uri")
-schedule_expression = cfg.get("schedule") or "cron(0 3 * * ? *)"
-cpu = cfg.get_int("cpu") or 1024
-memory = cfg.get_int("memory") or 2048
-container_name = cfg.get("container_name") or "indexer"
-env_vars = cfg.get_object("env") or {}
-retain_buckets = cfg.get_bool("retain_buckets") or False
-az_count = cfg.get_int("az_count") or 2
-nat_gateways = cfg.get_int("nat_gateways") if cfg.get("nat_gateways") is not None else 0
+single_nat = os.environ.get("SINGLE_NAT", "true").lower() in ("1", "true", "yes")
+nat_env = os.environ.get("NAT_GATEWAYS")
+if nat_env is not None and nat_env != "":
+    nat_gateways_val = int(nat_env)
+else:
+    nat_gateways_val = 1 if single_nat else az_count
+
+azs = aws.get_availability_zones(state="available").names[:az_count]
 
 def make_bucket(suffix):
     name = f"{project_prefix}-{suffix}"
@@ -32,43 +46,120 @@ def make_bucket(suffix):
         versioning_configuration={"status": "Enabled"},
         opts=pulumi.ResourceOptions(parent=b),
     )
-    aws.s3.BucketServerSideEncryptionConfigurationV2(
+    aws.s3.BucketServerSideEncryptionConfiguration(
         f"{name}-sse",
         bucket=b.id,
-        server_side_encryption_configuration={
-            "rule": {
-                "apply_server_side_encryption_by_default": {"sse_algorithm": "AES256"}
-            }
-        },
+        rules=[{"apply_server_side_encryption_by_default": {"sse_algorithm": "AES256"}}],
         opts=pulumi.ResourceOptions(parent=b),
     )
-    pulumi.log.info(f"created bucket {name}")
     return b
 
 raw_bucket = make_bucket("raw")
 chunks_bucket = make_bucket("chunks")
 meta_bucket = make_bucket("meta")
 
-vpc = awsx.ec2.Vpc(
+vpc = aws.ec2.Vpc(
     f"{project_prefix}-vpc",
-    number_of_availability_zones=az_count,
-    nat_gateways=nat_gateways,
+    cidr_block="10.0.0.0/16",
+    enable_dns_hostnames=True,
+    enable_dns_support=True,
+    tags={"Name": f"{project_prefix}-vpc", "project": project_prefix},
 )
+
+igw = aws.ec2.InternetGateway(
+    f"{project_prefix}-igw",
+    vpc_id=vpc.id,
+    tags={"Name": f"{project_prefix}-igw", "project": project_prefix},
+)
+
+public_route_table = aws.ec2.RouteTable(
+    f"{project_prefix}-public-rt",
+    vpc_id=vpc.id,
+    routes=[aws.ec2.RouteTableRouteArgs(cidr_block="0.0.0.0/0", gateway_id=igw.id)],
+    tags={"Name": f"{project_prefix}-public-rt", "project": project_prefix},
+)
+
+public_subnets = []
+private_subnets = []
+
+for i, az in enumerate(azs):
+    pub_cidr = f"10.0.{i}.0/24"
+    priv_cidr = f"10.0.{i+100}.0/24"
+    pub = aws.ec2.Subnet(
+        f"{project_prefix}-public-{i}",
+        vpc_id=vpc.id,
+        cidr_block=pub_cidr,
+        availability_zone=az,
+        map_public_ip_on_launch=True,
+        tags={"Name": f"{project_prefix}-public-{i}", "project": project_prefix},
+    )
+    public_subnets.append(pub)
+    aws.ec2.RouteTableAssociation(
+        f"{project_prefix}-public-rt-assoc-{i}",
+        subnet_id=pub.id,
+        route_table_id=public_route_table.id,
+    )
+
+    priv = aws.ec2.Subnet(
+        f"{project_prefix}-private-{i}",
+        vpc_id=vpc.id,
+        cidr_block=priv_cidr,
+        availability_zone=az,
+        map_public_ip_on_launch=False,
+        tags={"Name": f"{project_prefix}-private-{i}", "project": project_prefix},
+    )
+    private_subnets.append(priv)
+
+nat_gateways = []
+eips = []
+
+for n in range(nat_gateways_val):
+    target_pub_subnet = public_subnets[n if n < len(public_subnets) else 0]
+    eip = aws.ec2.Eip(f"{project_prefix}-eip-{n}", domain="vpc", tags={"Name": f"{project_prefix}-eip-{n}", "project": project_prefix})
+    eips.append(eip)
+    nat = aws.ec2.NatGateway(
+        f"{project_prefix}-natgw-{n}",
+        subnet_id=target_pub_subnet.id,
+        allocation_id=eip.allocation_id,
+        tags={"Name": f"{project_prefix}-natgw-{n}", "project": project_prefix},
+    )
+    nat_gateways.append(nat)
+
+private_rt_tables = []
+
+for idx, priv in enumerate(private_subnets):
+    rt = aws.ec2.RouteTable(
+        f"{project_prefix}-private-rt-{idx}",
+        vpc_id=vpc.id,
+        tags={"Name": f"{project_prefix}-private-rt-{idx}", "project": project_prefix},
+    )
+    private_rt_tables.append(rt)
+    chosen_nat = nat_gateways[0] if len(nat_gateways) == 1 else nat_gateways[idx % len(nat_gateways)]
+    aws.ec2.Route(
+        f"{project_prefix}-private-route-{idx}",
+        route_table_id=rt.id,
+        destination_cidr_block="0.0.0.0/0",
+        nat_gateway_id=chosen_nat.id,
+    )
+    aws.ec2.RouteTableAssociation(
+        f"{project_prefix}-private-rt-assoc-{idx}",
+        subnet_id=priv.id,
+        route_table_id=rt.id,
+    )
+
+private_subnet_ids = [s.id for s in private_subnets]
+public_subnet_ids = [s.id for s in public_subnets]
 
 task_sg = aws.ec2.SecurityGroup(
     f"{project_prefix}-task-sg",
-    vpc_id=vpc.vpc_id,
-    description="ECS task security group - allow outbound",
+    vpc_id=vpc.id,
+    description="ECS task security group - outbound allowed",
     egress=[aws.ec2.SecurityGroupEgressArgs(protocol="-1", from_port=0, to_port=0, cidr_blocks=["0.0.0.0/0"])],
     ingress=[],
     tags={"project": project_prefix, "component": "ecs-task-sg"},
 )
 
-log_group = aws.cloudwatch.LogGroup(
-    f"{project_prefix}-log",
-    name=f"/{project_prefix}/indexer",
-    retention_in_days=30,
-)
+log_group = aws.cloudwatch.LogGroup(f"{project_prefix}-log", name=f"/{project_prefix}/indexer", retention_in_days=30)
 
 ecr = aws.ecr.Repository(
     f"{project_prefix}-repo",
@@ -80,22 +171,17 @@ execution_role = aws.iam.Role(
     f"{project_prefix}-task-exec-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+        "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}],
     }),
     tags={"project": project_prefix, "component": "task-exec-role"},
 )
-
-aws.iam.RolePolicyAttachment(
-    f"{project_prefix}-exec-role-attach",
-    role=execution_role.name,
-    policy_arn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
-)
+aws.iam.RolePolicyAttachment(f"{project_prefix}-exec-role-attach", role=execution_role.name, policy_arn="arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy")
 
 task_role = aws.iam.Role(
     f"{project_prefix}-task-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+        "Statement": [{"Effect": "Allow", "Principal": {"Service": "ecs-tasks.amazonaws.com"}, "Action": "sts:AssumeRole"}],
     }),
     tags={"project": project_prefix, "component": "task-role"},
 )
@@ -111,8 +197,8 @@ task_policy = aws.iam.RolePolicy(
                 {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": [arns[0], arns[1], arns[2]]},
                 {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], "Resource": [f"{arns[0]}/*", f"{arns[1]}/*", f"{arns[2]}/*"]},
                 {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:CreateLogGroup"], "Resource": ["*"]},
-                {"Effect": "Allow", "Action": bedrock_actions, "Resource": ["*"]}
-            ]
+                {"Effect": "Allow", "Action": bedrock_actions, "Resource": ["*"]},
+            ],
         })
     ),
 )
@@ -132,14 +218,7 @@ container_definitions = pulumi.Output.all(log_group.name, ecr.repository_url).ap
         "memory": memory,
         "essential": True,
         "environment": [{"name": k, "value": str(v)} for k, v in (env_vars or {}).items()],
-        "logConfiguration": {
-            "logDriver": "awslogs",
-            "options": {
-                "awslogs-group": args[0],
-                "awslogs-region": aws_region,
-                "awslogs-stream-prefix": project_prefix,
-            }
-        }
+        "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": args[0], "awslogs-region": aws_region, "awslogs-stream-prefix": project_prefix}},
     }])
 )
 
@@ -161,7 +240,7 @@ events_role = aws.iam.Role(
     f"{project_prefix}-events-role",
     assume_role_policy=json.dumps({
         "Version": "2012-10-17",
-        "Statement": [{"Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+        "Statement": [{"Effect": "Allow", "Principal": {"Service": "events.amazonaws.com"}, "Action": "sts:AssumeRole"}],
     }),
     tags={"project": project_prefix, "component": "events-role"},
 )
@@ -175,33 +254,29 @@ events_policy = aws.iam.RolePolicy(
             "Statement": [
                 {"Effect": "Allow", "Action": ["ecs:RunTask"], "Resource": vals[1]},
                 {"Effect": "Allow", "Action": ["ecs:RunTask"], "Resource": vals[0]},
-                {"Effect": "Allow", "Action": ["iam:PassRole"], "Resource": [vals[2], vals[3]]}
-            ]
+                {"Effect": "Allow", "Action": ["iam:PassRole"], "Resource": [vals[2], vals[3]]},
+            ],
         })
     ),
 )
 
-rule = aws.cloudwatch.EventRule(
-    f"{project_prefix}-schedule",
-    description="Schedule to run the indexing task",
-    schedule_expression=schedule_expression,
-)
+rule = aws.cloudwatch.EventRule(f"{project_prefix}-schedule", description="Schedule to run the indexing task", schedule_expression=schedule_expression)
 
 target = aws.cloudwatch.EventTarget(
     f"{project_prefix}-target",
     rule=rule.name,
     arn=cluster.arn,
     role_arn=events_role.arn,
-    ecs_target=aws.cloudwatch.EventTargetEcsTargetArgs(
-        task_definition_arn=task_def.arn,
-        task_count=1,
-        launch_type="FARGATE",
-        network_configuration=aws.cloudwatch.EventTargetEcsTargetNetworkConfigurationArgs(
-            subnets=vpc.private_subnet_ids,
-            assign_public_ip=False,
-            security_groups=[task_sg.id],
-        ),
-    ),
+    ecs_target={
+        "task_definition_arn": task_def.arn,
+        "task_count": 1,
+        "launch_type": "FARGATE",
+        "network_configuration": {
+            "subnets": private_subnet_ids,
+            "security_groups": [task_sg.id],
+            "assign_public_ip": False,
+        },
+    },
     opts=pulumi.ResourceOptions(depends_on=[events_policy, task_def, cluster, events_role]),
 )
 

@@ -7,3 +7,5 @@ repos
 .venv
 context.md
 venv
+outputs.json
+output.json

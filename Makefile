@@ -43,10 +43,6 @@ tree:
 bootstrap:
 	bash infra/scripts/local_bootstrap.sh
 	
-s3:
-	aws s3 mb s3://$S3_BUCKET || true
-
-
 
 .PHONY: run-scraper
 run-scraper:
@@ -104,7 +100,8 @@ push-indexing-image:
 	bash indexing_pipeline/build_and_push_image.sh
 
 delete-pulumi-indexing-cronjob:
-	bash infra/pulumi_aws/indexing_cronjob/run.sh create
+	bash infra/pulumi_aws/indexing_cronjob/run.sh delete
+	
 pulumi-indexing-cronjob:
 	bash infra/pulumi_aws/indexing_cronjob/run.sh create
 

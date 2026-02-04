@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # scripts/build_and_push.sh
 # Build the indexing_pipeline Docker image and optionally push to Docker Hub or ECR.
-# Configure behaviour using environment variables
 set -euo pipefail
 
 IMAGE_NAME="${IMAGE_NAME:-civic-indexing}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+IMAGE_TAG="${IMAGE_TAG:-amd64-arm64-v3}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-./indexing_pipeline}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-${BUILD_CONTEXT}/Dockerfile}"
 IMAGE_LOCAL="${IMAGE_NAME}:${IMAGE_TAG}"
