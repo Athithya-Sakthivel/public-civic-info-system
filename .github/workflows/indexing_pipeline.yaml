@@ -18,7 +18,7 @@ env:
   NO_CACHE: '1'
 
   PUSH: 'true'
-  REGISTRY_TYPE: dockerhub
+  REGISTRY_TYPE: dockerhub    # set to "ecr" to push to ECR
   PUSH_LATEST: 'false'
 
   BUILD_CONTEXT: indexing_pipeline
@@ -76,7 +76,8 @@ jobs:
               *) DO_PUSH=false ;;
             esac
           fi
-          if [ "${ECR_REGISTRY}" = "true" ]; then USE_ECR=true; fi
+          if [ "${REGISTRY_TYPE}" = "ecr" ]; then USE_ECR=true; fi
+          # never push from fork PRs
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then DO_PUSH=false; fi
           echo "do_push=${DO_PUSH}" >> "$GITHUB_OUTPUT"
           echo "use_ecr=${USE_ECR}" >> "$GITHUB_OUTPUT"
@@ -173,29 +174,25 @@ jobs:
           EXPECTED_COUNT=$(echo "${PLATFORMS}" | awk -F, '{print NF}')
           RAW=$(docker buildx imagetools inspect "$IMAGE" --raw 2>/dev/null || docker manifest inspect "$IMAGE" 2>/dev/null || true)
           if [ -z "$RAW" ]; then echo "ERROR: unable to fetch manifest for $IMAGE" >&2; exit 1; fi
-          python - <<'PY'
+          COUNT=$(echo "$RAW" | python - <<'PY'
 import sys, json
 raw=sys.stdin.read()
 j=json.loads(raw)
 arches=set()
 if isinstance(j, dict) and 'manifests' in j:
   for m in j['manifests']:
-    if 'platform' in m and 'architecture' in m['platform']:
-      arches.add(m['platform']['architecture'])
+    p=m.get('platform') or {}
+    a=p.get('architecture')
+    if a: arches.add(a)
 elif isinstance(j, list):
-  for entry in j:
-    if 'platform' in entry and 'architecture' in entry['platform']:
-      arches.add(entry['platform']['architecture'])
-print(",".join(sorted(arches)))
-PY <<EOF
-$RAW
-EOF
-          COUNT=$(echo "$RAW" | python -c "import sys,json; j=json.load(sys.stdin); a=set(); 
-if isinstance(j, dict) and 'manifests' in j:
-  [a.add(m.get('platform',{}).get('architecture','')) for m in j['manifests']]
-else:
-  [a.add(e.get('platform',{}).get('architecture','')) for e in j if isinstance(e, dict)]
-print(len([x for x in a if x]))")
+  for e in j:
+    p=e.get('platform') or {}
+    a=p.get('architecture')
+    if a: arches.add(a)
+print(len(arches))
+PY
+)
+          if [ -z "$COUNT" ]; then echo "[ERROR] manifest parse returned empty" >&2; exit 1; fi
           if [ "$COUNT" -lt "$EXPECTED_COUNT" ]; then
             echo "[ERROR] manifest platforms mismatch: expected ${EXPECTED_COUNT}, got ${COUNT}" >&2
             echo "$RAW" >&2
