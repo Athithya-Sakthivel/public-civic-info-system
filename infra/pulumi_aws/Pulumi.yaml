@@ -1,2 +1,2 @@
-name: indexing-cronjob
+name: pulumi-infra
 runtime: python

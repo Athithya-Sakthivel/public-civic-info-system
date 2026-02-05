@@ -10,7 +10,7 @@ set -euo pipefail
 # Configurable inputs (via env or defaults)
 # -------------------------
 IMAGE_NAME="${IMAGE_NAME:-civic-indexing}"
-IMAGE_TAG="${IMAGE_TAG:-amd64-arm64-v4}"
+IMAGE_TAG="${IMAGE_TAG:-amd64-arm64-v5}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-./indexing_pipeline}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-${BUILD_CONTEXT}/Dockerfile}"
 

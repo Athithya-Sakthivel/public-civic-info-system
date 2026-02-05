@@ -50,7 +50,11 @@ run-scraper:
 	PYTHONPATH="$$(pwd)" \
 	python3 ELT/extract_load/web_scraper.py
 
+create-s3:
+	python3 infra/scripts/s3.py --create
 
+delete-s3:
+	python3 infra/scripts/s3.py --delete --force
 
 PYTHON := python3
 SCRIPT := infra/scripts/sync_s3_with_local_fs.py
