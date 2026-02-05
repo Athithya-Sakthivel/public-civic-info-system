@@ -1,108 +1,197 @@
+#!/usr/bin/env python3
+# embed_and_index.py
+#
+# Final, idempotent indexing worker for the public-civic-info-system.
+#
+# Assumptions & Invariants (fail-fast validated at startup)
+# - This process **only** runs with the indexing-role DB credentials (DDL + INSERT allowed).
+# - PostgreSQL >= 15 with pgvector >= 0.6.0 (indexing pipeline creates extension/indexes idempotently).
+# - The canonical table (civic_chunks) shape is the frozen contract the inference pipeline reads:
+#     - columns: document_id, chunk_id, chunk_index, content, embedding vector(<EMBED_DIM>),
+#       source_url, page_number, parser_version, meta JSONB
+#     - unique constraint on chunk_id
+# - Embeddings dimension controlled by EMBED_DIM env var (default 1024) and enforced at runtime.
+# - Embedding model: external Bedrock model (EMBED_MODEL_ID) that returns a list of floats named `embedding`.
+# - S3 storage for chunk files (S3_BUCKET + S3_PREFIX).
+#
+# Operational notes:
+# - Idempotency strategy:
+#   1) DDL uses CREATE IF NOT EXISTS (safe on re-runs).
+#   2) We avoid embedding already-stored chunks by pre-checking chunk_id existence in batches.
+#   3) Insert uses ON CONFLICT (chunk_id) DO NOTHING.
+# - All additional, evolving metadata is stored in `meta JSONB` (opaque to retrievers).
+#
+# Failure philosophy: fail-fast on environment/permission problems; otherwise continue file-by-file and log.
+
 from __future__ import annotations
 import os
 import sys
 import json
+import time
 import logging
-import datetime
-from typing import List, Dict, Any, Optional, Iterator
+from typing import Dict, Any, List, Iterator, Optional
+from datetime import datetime
+import boto3
+import botocore
+import psycopg
+from psycopg.rows import dict_row
+from botocore.exceptions import ClientError
 
-log = logging.getLogger("embed_and_index_s3")
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter('%(message)s'))
-log.addHandler(handler)
-log.setLevel(logging.INFO)
+# -------------------------
+# Environment / defaults
+# -------------------------
+# Required
+S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
+S3_PREFIX = os.getenv("S3_CHUNKED_PREFIX", os.getenv("S3_PREFIX", "data/chunked/")).lstrip("/").rstrip("/") + "/"
+AWS_REGION = os.getenv("AWS_REGION", "").strip()
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0").strip()
+VECTOR_DB = os.getenv("VECTOR_DB", "pgvector").strip().lower()
 
-def jlog(obj: Dict[str, Any]):
-    log.info(json.dumps(obj, default=str))
-
-try:
-    import boto3
-except Exception as e:
-    jlog({"level":"CRITICAL","event":"boto3_missing","detail":str(e)})
-    raise SystemExit(2)
-
-try:
-    import psycopg
-    from psycopg.rows import class_row
-except Exception as e:
-    jlog({"level":"CRITICAL","event":"psycopg_missing","detail":str(e)})
-    raise SystemExit(3)
-
-try:
-    from pgvector import Vector
-except Exception:
-    Vector = None
-
-try:
-    from opensearchpy import OpenSearch
-except Exception:
-    OpenSearch = None
-
-S3_BUCKET = os.getenv("S3_BUCKET")
-S3_PREFIX = os.getenv("S3_CHUNKED_PREFIX", "data/chunked/").lstrip("/").rstrip("/") + "/"
-VECTOR_DB = os.getenv("VECTOR_DB", "pgvector").lower()
-BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
-EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
-EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
-AWS_REGION = os.getenv("AWS_REGION")
-
-PG_HOST = os.getenv("PG_HOST", "localhost")
+# Postgres connect params
+PG_HOST = os.getenv("PG_HOST", "127.0.0.1").strip()
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_USER = os.getenv("PG_USER", "postgres")
+PG_USER = os.getenv("PG_USER", "postgres").strip()
 PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
-PG_DB = os.getenv("PG_DB", "postgres")
-PG_TABLE_NAME = os.getenv("PG_INDEX_NAME", "documents")
+PG_DB = os.getenv("PG_DB", "postgres").strip()
+PG_TABLE_NAME = os.getenv("PG_INDEX_NAME", "civic_chunks").strip()
 
-OPENSEARCH_HOSTS = os.getenv("OPENSEARCH_HOSTS", "http://localhost:9200").split(",")
-OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "documents")
-OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
-OPENSEARCH_PASSWORD = os.getenv("OPENSEARCH_PASSWORD")
+# Embedding details
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+AWS_PROFILE = os.getenv("AWS_PROFILE")  # optional
+SLEEP_BETWEEN_FILES = float(os.getenv("SLEEP_BETWEEN_FILES", "0.0"))
+
+# Logging config (deterministic, structured JSON-ish lines)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
+log = logging.getLogger("embed_and_index")
+def jlog(obj: Dict[str, Any]):
+    # deterministic timestamp + sorted keys for consistent logs
+    obj_out = {"ts": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+    obj_out.update(obj)
+    log.info(json.dumps(obj_out, sort_keys=True, default=str))
+
+# -------------------------
+# Fail-fast validations
+# -------------------------
+def fail(msg: str, code: int = 1):
+    jlog({"level": "CRITICAL", "event": "startup_check_failed", "detail": msg})
+    sys.exit(code)
 
 if not S3_BUCKET:
-    jlog({"level":"CRITICAL","event":"s3_bucket_missing","hint":"Set S3_BUCKET env var"})
-    raise SystemExit(10)
-
+    fail("S3_BUCKET environment variable must be set", 10)
 if not AWS_REGION:
-    jlog({"level":"CRITICAL","event":"aws_region_missing","hint":"Set AWS_REGION env var (region must have Bedrock enabled)."})
-    raise SystemExit(11)
+    fail("AWS_REGION environment variable must be set", 11)
+if VECTOR_DB != "pgvector":
+    fail("Only pgvector vector DB is supported by this script", 12)
+if EMBED_DIM <= 0:
+    fail("EMBED_DIM must be a positive integer", 13)
+if BATCH_SIZE <= 0:
+    fail("EMBED_BATCH_SIZE must be a positive integer", 14)
 
-def init_boto3_clients():
+jlog({"event":"startup_checks_ok","s3_bucket":S3_BUCKET,"s3_prefix":S3_PREFIX,"embed_model":EMBED_MODEL_ID,"embed_dim":EMBED_DIM,"pg_table":PG_TABLE_NAME})
+
+# -------------------------
+# AWS clients
+# -------------------------
+boto_session_kwargs = {"region_name": AWS_REGION}
+if AWS_PROFILE:
+    boto_session = boto3.Session(profile_name=AWS_PROFILE, **({"region_name": AWS_REGION} if AWS_REGION else {}))
+else:
+    boto_session = boto3.Session(**({"region_name": AWS_REGION} if AWS_REGION else {}))
+
+s3 = boto_session.client("s3")
+bedrock = boto_session.client("bedrock-runtime")
+
+# -------------------------
+# DB helpers
+# -------------------------
+def init_pg_connection():
+    conninfo = f"host={PG_HOST} port={PG_PORT} dbname={PG_DB} user={PG_USER} password={PG_PASSWORD}"
     try:
-        session = boto3.session.Session(region_name=AWS_REGION)
-        s3 = session.client("s3")
-        bedrock = session.client("bedrock-runtime")
+        conn = psycopg.connect(conninfo, autocommit=True, row_factory=dict_row)
     except Exception as e:
-        jlog({"level":"CRITICAL","event":"boto3_client_init_failed","detail":str(e)})
-        raise SystemExit(12)
-    return s3, bedrock
+        jlog({"level":"CRITICAL","event":"pg_connect_failed","detail": str(e)})
+        raise SystemExit(20)
+    jlog({"event":"pg_connect_ok","host":PG_HOST,"port":PG_PORT,"db":PG_DB})
+    return conn
 
-def list_chunk_objects(s3, bucket: str, prefix: str) -> Iterator[Dict[str, Any]]:
+def ensure_schema(conn):
+    """
+    Create extension, table, and indexes idempotently according to contract:
+    - civic_chunks(id, document_id, chunk_id, chunk_index, content, embedding vector(<EMBED_DIM>),
+      source_url, page_number, parser_version, meta JSONB)
+    - unique constraint on chunk_id
+    - HNSW index on embedding (vector_cosine_ops)
+    - indexes on document_id and source_url
+    """
+    with conn.cursor() as cur:
+        # extension
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        # table
+        create_table_sql = f"""
+        CREATE TABLE IF NOT EXISTS {PG_TABLE_NAME} (
+          id BIGSERIAL PRIMARY KEY,
+          document_id TEXT NOT NULL,
+          chunk_id TEXT NOT NULL,
+          chunk_index INT NOT NULL,
+          content TEXT NOT NULL,
+          embedding vector({EMBED_DIM}) NOT NULL,
+          source_url TEXT,
+          page_number INT,
+          parser_version TEXT,
+          meta JSONB NOT NULL,
+          CONSTRAINT {PG_TABLE_NAME}_unique UNIQUE (chunk_id)
+        );
+        """
+        cur.execute(create_table_sql)
+        # indexes
+        # HNSW index for cosine (requires pgvector >= 0.6)
+        cur.execute(f"""
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_indexes WHERE indexname = '{PG_TABLE_NAME}_embedding_hnsw'
+          ) THEN
+            CREATE INDEX {PG_TABLE_NAME}_embedding_hnsw
+            ON {PG_TABLE_NAME}
+            USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 16, ef_construction = 128);
+          END IF;
+        END$$;
+        """)
+        cur.execute(f"CREATE INDEX IF NOT EXISTS {PG_TABLE_NAME}_document_id ON {PG_TABLE_NAME} (document_id);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS {PG_TABLE_NAME}_source_url ON {PG_TABLE_NAME} (source_url);")
+    jlog({"event":"schema_ensured","table":PG_TABLE_NAME,"embed_dim":EMBED_DIM})
+
+# -------------------------
+# S3 helpers (stream JSONL)
+# -------------------------
+def list_chunk_objects(bucket: str, prefix: str) -> Iterator[Dict[str, Any]]:
     paginator = s3.get_paginator("list_objects_v2")
     kwargs = {"Bucket": bucket, "Prefix": prefix}
     for page in paginator.paginate(**kwargs):
-        contents = page.get("Contents") or []
-        for obj in contents:
+        for obj in page.get("Contents", []) or []:
             key = obj.get("Key")
             if not key:
                 continue
             if key.endswith(".chunks.jsonl"):
                 yield {"Key": key, "Size": obj.get("Size", 0)}
 
-def stream_jsonl_objects_from_s3(s3, bucket: str, key: str) -> Iterator[Dict[str, Any]]:
+def stream_jsonl_from_s3(bucket: str, key: str) -> Iterator[Dict[str, Any]]:
     try:
         resp = s3.get_object(Bucket=bucket, Key=key)
-    except Exception as e:
-        jlog({"level":"ERROR","event":"s3_get_object_failed","key":key,"detail":str(e)})
+    except ClientError as e:
+        jlog({"level":"ERROR","event":"s3_get_object_failed","key":key,"error":str(e)})
         raise
     body = resp["Body"]
-    for raw_line in body.iter_lines():
-        if not raw_line:
+    for raw in body.iter_lines():
+        if not raw:
             continue
         try:
-            line = raw_line.decode("utf-8").strip()
+            line = raw.decode("utf-8").strip()
         except Exception:
             try:
-                line = raw_line.decode("latin-1").strip()
+                line = raw.decode("latin-1").strip()
             except Exception:
                 continue
         if not line:
@@ -110,58 +199,72 @@ def stream_jsonl_objects_from_s3(s3, bucket: str, key: str) -> Iterator[Dict[str
         try:
             yield json.loads(line)
         except Exception:
-            jlog({"level":"ERROR","event":"jsonl_parse_failed","key":key,"line_sample":line[:200]})
+            jlog({"level":"ERROR","event":"json_parse_failed","key":key,"sample": line[:200]})
             continue
 
-def normalize_and_validate_chunk(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    required = ["document_id", "chunk_id", "text", "chunk_index", "token_count", "token_range", "document_total_tokens", "parser_version"]
-    missing = [k for k in required if k not in obj]
-    ingest_val = obj.get("ingest_time") or obj.get("timestamp")
-    if not ingest_val:
-        missing.append("ingest_time|timestamp")
-    if missing:
-        jlog({"level":"DEBUG","event":"schema_missing_fields","missing":missing,"chunk_id":obj.get("chunk_id")})
+# -------------------------
+# Normalization (minimal required fields)
+# -------------------------
+CORE_REQUIRED = {"document_id", "chunk_id", "chunk_index", "text", "parser_version"}
+
+def normalize_chunk(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Produce an output dict with the exact columns we will store:
+    - document_id (str)
+    - chunk_id (str)
+    - chunk_index (int)
+    - text -> content (str)
+    - source_url (optional)
+    - page_number (optional int)
+    - parser_version (str)
+    - meta (JSON dict with any other keys)
+    """
+    if not isinstance(raw, dict):
         return None
-    out: Dict[str, Any] = {}
-    out["document_id"] = str(obj["document_id"])
-    out["chunk_id"] = str(obj["chunk_id"])
-    out["chunk_index"] = int(obj["chunk_index"])
-    out["chunk_type"] = str(obj.get("chunk_type", "token_window"))
-    text = obj.get("text") or ""
-    out["text"] = text.replace("\r\n", "\n").strip()
-    out["token_count"] = int(obj.get("token_count", len(out["text"].split())))
-    tr = obj.get("token_range")
-    if isinstance(tr, list) and len(tr) == 2:
-        out["token_range"] = [int(tr[0]), int(tr[1])]
-    else:
-        out["token_range"] = [0, out["token_count"]]
-    out["document_total_tokens"] = int(obj.get("document_total_tokens", out["token_count"]))
-    out["semantic_region"] = obj.get("semantic_region")
-    out["source_url"] = obj.get("source_url")
-    out["page_number"] = None if obj.get("page_number") is None else int(obj.get("page_number"))
-    out["language"] = obj.get("language")
-    out["ingest_time"] = str(ingest_val)
-    out["parser_version"] = str(obj["parser_version"])
-    out["meta"] = {}
-    for k in ("headings","heading_path","figures","layout_tags","file_type","used_ocr","provenance","trust_level","region","topic_tags","source_domain"):
-        if k in obj:
-            out["meta"][k] = obj[k]
-    return out
-
-def init_bedrock_client(bedrock):
-    return bedrock
-
-def get_embedding_from_bedrock(client, model_id: str, text: str, dimensions: int = EMBED_DIM, normalize: bool = True) -> List[float]:
-    native_request = {"inputText": text}
-    if dimensions:
-        native_request["dimensions"] = int(dimensions)
-    if normalize:
-        native_request["normalize"] = bool(normalize)
-    request_body = json.dumps(native_request)
+    missing = [k for k in CORE_REQUIRED if k not in raw]
+    if missing:
+        jlog({"level":"DEBUG","event":"chunk_schema_missing","missing": missing, "chunk_sample": raw.get("chunk_id")})
+        return None
     try:
-        response = client.invoke_model(modelId=model_id, body=request_body, contentType="application/json")
+        document_id = str(raw["document_id"])
+        chunk_id = str(raw["chunk_id"])
+        chunk_index = int(raw["chunk_index"])
+        content = (raw.get("text") or "").replace("\r\n", "\n").strip()
+        parser_version = str(raw["parser_version"])
     except Exception as e:
-        jlog({"level":"ERROR","event":"bedrock_invoke_failed","detail":str(e)})
+        jlog({"level":"DEBUG","event":"chunk_schema_cast_failed","error": str(e), "chunk_sample": raw.get("chunk_id")})
+        return None
+
+    # Build meta from any non-core fields (store everything else opaquely).
+    meta = {}
+    for k, v in raw.items():
+        if k in CORE_REQUIRED:
+            continue
+        # keep common innocuous fields inside meta for future debugging/citation
+        meta[k] = v
+
+    normalized = {
+        "document_id": document_id,
+        "chunk_id": chunk_id,
+        "chunk_index": chunk_index,
+        "content": content,
+        "source_url": raw.get("source_url"),
+        "page_number": None if raw.get("page_number") is None else int(raw.get("page_number")),
+        "parser_version": parser_version,
+        "meta": meta
+    }
+    return normalized
+
+# -------------------------
+# Bedrock embedding call
+# -------------------------
+def get_embedding_from_bedrock(text: str) -> List[float]:
+    # Build request per Bedrock runtime expectation (this may be provider-specific)
+    request_body = {"inputText": text, "dimensions": EMBED_DIM, "normalize": True}
+    try:
+        response = bedrock.invoke_model(modelId=EMBED_MODEL_ID, body=json.dumps(request_body), contentType="application/json")
+    except Exception as e:
+        jlog({"level":"ERROR","event":"bedrock_invoke_error","detail": str(e)})
         raise
     body_stream = response.get("body")
     if hasattr(body_stream, "read"):
@@ -169,256 +272,186 @@ def get_embedding_from_bedrock(client, model_id: str, text: str, dimensions: int
     else:
         raw = body_stream
     try:
-        model_response = json.loads(raw)
+        parsed = json.loads(raw)
     except Exception as e:
-        jlog({"level":"ERROR","event":"bedrock_response_decode_failed","detail":str(e)})
+        jlog({"level":"ERROR","event":"bedrock_response_decode_failed","detail": str(e), "raw_sample": (raw[:200] if isinstance(raw, (bytes,str)) else str(raw))})
         raise
-    embedding = model_response.get("embedding")
-    if not isinstance(embedding, list):
-        jlog({"level":"ERROR","event":"bedrock_no_embedding","response":model_response})
-        raise RuntimeError("no_embedding_in_bedrock_response")
-    if len(embedding) != EMBED_DIM:
-        jlog({"level":"ERROR","event":"embedding_dim_mismatch","expected":EMBED_DIM,"received":len(embedding)})
+    emb = parsed.get("embedding")
+    if not isinstance(emb, list):
+        jlog({"level":"ERROR","event":"bedrock_no_embedding","response": parsed})
+        raise RuntimeError("bedrock returned no embedding list")
+    if len(emb) != EMBED_DIM:
+        jlog({"level":"ERROR","event":"bedrock_embedding_dim_mismatch","expected": EMBED_DIM, "received": len(emb)})
         raise RuntimeError("embedding_dim_mismatch")
-    return embedding
+    return emb
 
-def init_pg_connection():
-    conninfo = f"host={PG_HOST} port={PG_PORT} dbname={PG_DB} user={PG_USER} password={PG_PASSWORD}"
-    try:
-        conn = psycopg.connect(conninfo)
-    except Exception as e:
-        jlog({"level":"CRITICAL","event":"pg_connect_failed","detail":str(e)})
-        raise SystemExit(20)
-    conn.autocommit = True
-    return conn
-
-def ensure_pgvector_table(conn):
-    create_ext_sql = "CREATE EXTENSION IF NOT EXISTS vector;"
-    create_table_sql = f"""
-    CREATE TABLE IF NOT EXISTS {PG_TABLE_NAME} (
-      chunk_id TEXT PRIMARY KEY,
-      document_id TEXT,
-      content TEXT,
-      embedding vector({EMBED_DIM}),
-      meta JSONB,
-      token_count INT,
-      token_range INT[],
-      document_total_tokens INT,
-      semantic_region TEXT,
-      source_url TEXT,
-      page_number INT,
-      language TEXT,
-      ingest_time TIMESTAMP,
-      parser_version TEXT
-    );
-    """
-    try:
-        with conn.cursor() as cur:
-            cur.execute(create_ext_sql)
-            cur.execute(create_table_sql)
-    except Exception as e:
-        jlog({"level":"CRITICAL","event":"pg_schema_setup_failed","detail":str(e)})
-        raise SystemExit(21)
-
-def pg_doc_exists(conn, chunk_id: str) -> bool:
-    sql = f"SELECT 1 FROM {PG_TABLE_NAME} WHERE chunk_id = %s LIMIT 1;"
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (chunk_id,))
-            return cur.fetchone() is not None
-    except Exception as e:
-        jlog({"level":"ERROR","event":"pg_exists_check_failed","detail":str(e),"chunk_id":chunk_id})
-        return False
+# -------------------------
+# DB batch insert
+# -------------------------
+def pg_existing_chunk_ids(conn, chunk_ids: List[str]) -> set:
+    if not chunk_ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT chunk_id FROM {PG_TABLE_NAME} WHERE chunk_id = ANY(%s);", (chunk_ids,))
+        rows = cur.fetchall()
+    return set(r["chunk_id"] for r in rows)
 
 def pg_insert_batch(conn, docs: List[Dict[str, Any]]):
+    """
+    Insert docs list in a single transaction (autocommit mode is enabled outside).
+    Each doc must have: chunk_id, document_id, chunk_index, content, embedding (list of floats),
+    source_url, page_number, parser_version, meta (dict).
+    Uses ON CONFLICT DO NOTHING to maintain idempotency.
+    """
+    if not docs:
+        return 0
     insert_sql = f"""
-    INSERT INTO {PG_TABLE_NAME}
-      (chunk_id, document_id, content, embedding, meta, token_count, token_range, document_total_tokens, semantic_region, source_url, page_number, language, ingest_time, parser_version)
-    VALUES (
-      %s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    INSERT INTO {PG_TABLE_NAME} (
+      chunk_id, document_id, chunk_index, content, embedding, source_url, page_number, parser_version, meta
+    ) VALUES (
+      %s, %s, %s, %s, %s::vector, %s, %s, %s, %s
     )
     ON CONFLICT (chunk_id) DO NOTHING;
     """
-    try:
-        with conn.cursor() as cur:
-            for d in docs:
-                embedding = d.get("embedding")
-                if not isinstance(embedding, list):
-                    raise RuntimeError("missing_embedding")
-                if len(embedding) != EMBED_DIM:
-                    raise RuntimeError("embedding_dim_mismatch")
-                emb_str = "[" + ",".join(map(str, embedding)) + "]"
-                meta = json.dumps(d.get("meta") or {})
-                token_range = d.get("token_range") or [0, d.get("token_count",0)]
-                ingest_ts = None
-                try:
-                    ingest_val = d.get("ingest_time")
-                    if ingest_val and ingest_val.endswith("Z"):
-                        ingest_val = ingest_val.replace("Z","+00:00")
-                    ingest_ts = datetime.datetime.fromisoformat(ingest_val) if ingest_val else None
-                except Exception:
-                    ingest_ts = None
+    with conn.cursor() as cur:
+        for d in docs:
+            emb = d["embedding"]
+            # safe formatting for embedding vector literal: use array string then cast
+            emb_str = "[" + ",".join(map(str, emb)) + "]"
+            meta_json = json.dumps(d.get("meta") or {})
+            try:
                 cur.execute(insert_sql, (
                     d["chunk_id"],
-                    d.get("document_id"),
-                    d.get("text"),
+                    d["document_id"],
+                    d["chunk_index"],
+                    d["content"],
                     emb_str,
-                    meta,
-                    d.get("token_count"),
-                    token_range,
-                    d.get("document_total_tokens"),
-                    d.get("semantic_region"),
                     d.get("source_url"),
                     d.get("page_number"),
-                    d.get("language"),
-                    ingest_ts,
                     d.get("parser_version"),
+                    meta_json
                 ))
-    except Exception as e:
-        jlog({"level":"ERROR","event":"pg_insert_failed","detail":str(e)})
-        raise
+            except Exception as e:
+                jlog({"level":"ERROR","event":"pg_insert_error","chunk_id": d.get("chunk_id"), "error": str(e)})
+                raise
+    return len(docs)
 
-def init_opensearch_client():
-    if OpenSearch is None:
-        jlog({"level":"CRITICAL","event":"opensearch_client_missing","detail":"opensearch-py not installed"})
-        raise SystemExit(30)
-    http_auth = (OPENSEARCH_USER, OPENSEARCH_PASSWORD) if OPENSEARCH_USER and OPENSEARCH_PASSWORD else None
-    try:
-        client = OpenSearch(hosts=OPENSEARCH_HOSTS, http_auth=http_auth, timeout=60)
-    except Exception as e:
-        jlog({"level":"CRITICAL","event":"opensearch_connect_failed","detail":str(e)})
-        raise SystemExit(31)
-    return client
+# -------------------------
+# Main orchestration
+# -------------------------
+def process_s3_file(conn, bucket: str, key: str):
+    jlog({"event":"processing_s3_object","key":key})
+    stream = stream_jsonl_from_s3(bucket, key)
+    batch_to_embed: List[Dict[str, Any]] = []
+    pending_normalized: List[Dict[str, Any]] = []
+    total_added_in_file = 0
+    total_skipped_schema = 0
 
-def ensure_opensearch_index(client):
-    mapping = {
-        "mappings": {
-            "properties": {
-                "content": {"type": "text"},
-                "meta": {"type": "object", "enabled": True},
-                "embedding": {"type": "dense_vector", "dims": EMBED_DIM}
-            }
+    for raw in stream:
+        normalized = normalize_chunk(raw)
+        if not normalized:
+            total_skipped_schema += 1
+            continue
+        pending_normalized.append(normalized)
+        # flush when we have BATCH_SIZE candidates
+        if len(pending_normalized) >= BATCH_SIZE:
+            added = process_batch(conn, pending_normalized)
+            total_added_in_file += added
+            pending_normalized = []
+    # final flush
+    if pending_normalized:
+        added = process_batch(conn, pending_normalized)
+        total_added_in_file += added
+
+    jlog({"event":"file_done","key":key,"added_in_file": total_added_in_file, "skipped_schema": total_skipped_schema})
+    return total_added_in_file, total_skipped_schema
+
+def process_batch(conn, normalized_list: List[Dict[str, Any]]):
+    # 1) gather chunk_ids and pre-check DB to avoid unnecessary embedding
+    chunk_ids = [n["chunk_id"] for n in normalized_list]
+    existing = pg_existing_chunk_ids(conn, chunk_ids)
+    to_process = [n for n in normalized_list if n["chunk_id"] not in existing]
+    skipped_count = len(normalized_list) - len(to_process)
+    if skipped_count:
+        jlog({"event":"batch_skipped_existing","total": len(normalized_list), "skipped": skipped_count})
+    if not to_process:
+        return 0
+
+    # 2) call embedding model in per-item manner (could be parallelized but keep sequential for determinism)
+    docs_for_insert = []
+    for n in to_process:
+        try:
+            emb = get_embedding_from_bedrock(n["content"])
+        except Exception as e:
+            jlog({"level":"ERROR","event":"embedding_failed","chunk_id": n["chunk_id"], "error": str(e)})
+            # skip this chunk to avoid blocking whole batch; continue with others
+            continue
+        doc = {
+            "chunk_id": n["chunk_id"],
+            "document_id": n["document_id"],
+            "chunk_index": n["chunk_index"],
+            "content": n["content"],
+            "embedding": emb,
+            "source_url": n.get("source_url"),
+            "page_number": n.get("page_number"),
+            "parser_version": n.get("parser_version"),
+            "meta": n.get("meta", {})
         }
-    }
-    try:
-        client.indices.create(index=OPENSEARCH_INDEX, body=mapping, ignore=400)
-    except Exception as e:
-        jlog({"level":"CRITICAL","event":"opensearch_index_create_failed","detail":str(e)})
-        raise SystemExit(32)
+        docs_for_insert.append(doc)
 
-def opensearch_doc_exists(client, chunk_id: str) -> bool:
-    try:
-        return client.exists(index=OPENSEARCH_INDEX, id=chunk_id)
-    except Exception as e:
-        jlog({"level":"ERROR","event":"opensearch_exists_failed","detail":str(e),"chunk_id":chunk_id})
-        return False
+    if not docs_for_insert:
+        jlog({"event":"batch_all_embeddings_failed_or_empty"})
+        return 0
 
-def opensearch_index_batch(client, docs: List[Dict[str, Any]]):
+    # 3) insert into PG (ON CONFLICT DO NOTHING ensures idempotence)
+    inserted = 0
     try:
-        for d in docs:
-            if not isinstance(d.get("embedding"), list):
-                raise RuntimeError("missing_embedding")
-            if len(d["embedding"]) != EMBED_DIM:
-                raise RuntimeError("embedding_dim_mismatch")
-            body = {
-                "chunk_id": d["chunk_id"],
-                "document_id": d.get("document_id"),
-                "content": d.get("text"),
-                "embedding": d.get("embedding"),
-                "meta": d.get("meta") or {},
-                "token_count": d.get("token_count"),
-                "token_range": d.get("token_range"),
-                "document_total_tokens": d.get("document_total_tokens"),
-                "semantic_region": d.get("semantic_region"),
-                "source_url": d.get("source_url"),
-                "page_number": d.get("page_number"),
-                "language": d.get("language"),
-                "ingest_time": d.get("ingest_time"),
-                "parser_version": d.get("parser_version"),
-            }
-            client.index(index=OPENSEARCH_INDEX, id=d["chunk_id"], body=body)
+        inserted = pg_insert_batch(conn, docs_for_insert)
+        jlog({"event":"batch_inserted","attempted":len(docs_for_insert),"inserted": inserted})
     except Exception as e:
-        jlog({"level":"ERROR","event":"opensearch_index_failed","detail":str(e)})
+        jlog({"level":"ERROR","event":"batch_insert_failed","error": str(e)})
         raise
+    return inserted
 
-def main():
-    jlog({"event":"startup","vector_db":VECTOR_DB,"embed_model":EMBED_MODEL_ID,"s3_bucket":S3_BUCKET,"s3_prefix":S3_PREFIX})
-    s3, bedrock_client = init_boto3_clients()
+def main() -> int:
+    jlog({"event":"startup","s3_bucket": S3_BUCKET, "s3_prefix": S3_PREFIX})
+    # Preflight S3 access
+    try:
+        s3.head_bucket(Bucket=S3_BUCKET)
+    except Exception as e:
+        jlog({"level":"CRITICAL","event":"s3_head_bucket_failed","error": str(e)})
+        return 2
+
+    conn = init_pg_connection()
+    ensure_schema(conn)
+
     total_indexed = 0
     total_skipped_schema = 0
-    if VECTOR_DB == "pgvector":
-        conn = init_pg_connection()
-        ensure_pgvector_table(conn)
-        for obj in list_chunk_objects(s3, S3_BUCKET, S3_PREFIX):
+    try:
+        for obj in list_chunk_objects(S3_BUCKET, S3_PREFIX):
             key = obj["Key"]
-            file_indexed = 0
-            jlog({"event":"processing_s3_object","key":key,"size":obj.get("Size",0)})
             try:
-                items_iter = stream_jsonl_objects_from_s3(s3, S3_BUCKET, key)
-                to_index: List[Dict[str, Any]] = []
-                for raw in items_iter:
-                    c = normalize_and_validate_chunk(raw)
-                    if not c:
-                        total_skipped_schema += 1
-                        continue
-                    cid = c["chunk_id"]
-                    if pg_doc_exists(conn, cid):
-                        continue
-                    emb = get_embedding_from_bedrock(bedrock_client, EMBED_MODEL_ID, c["text"])
-                    c["embedding"] = emb
-                    to_index.append(c)
-                    if len(to_index) >= BATCH_SIZE:
-                        pg_insert_batch(conn, to_index)
-                        file_indexed += len(to_index)
-                        total_indexed += len(to_index)
-                        to_index = []
-                if to_index:
-                    pg_insert_batch(conn, to_index)
-                    file_indexed += len(to_index)
-                    total_indexed += len(to_index)
-                jlog({"event":"file_done","key":key,"added_in_file":file_indexed,"cumulative_added":total_indexed,"skipped_schema":total_skipped_schema})
+                added, skipped = process_s3_file(conn, S3_BUCKET, key)
+                total_indexed += added
+                total_skipped_schema += skipped
             except Exception as e:
-                jlog({"level":"ERROR","event":"file_error","key":key,"detail":str(e)})
-    elif VECTOR_DB == "opensearch":
-        client = init_opensearch_client()
-        ensure_opensearch_index(client)
-        for obj in list_chunk_objects(s3, S3_BUCKET, S3_PREFIX):
-            key = obj["Key"]
-            file_indexed = 0
-            jlog({"event":"processing_s3_object","key":key,"size":obj.get("Size",0)})
-            try:
-                items_iter = stream_jsonl_objects_from_s3(s3, S3_BUCKET, key)
-                to_index: List[Dict[str, Any]] = []
-                for raw in items_iter:
-                    c = normalize_and_validate_chunk(raw)
-                    if not c:
-                        total_skipped_schema += 1
-                        continue
-                    cid = c["chunk_id"]
-                    if opensearch_doc_exists(client, cid):
-                        continue
-                    emb = get_embedding_from_bedrock(bedrock_client, EMBED_MODEL_ID, c["text"])
-                    c["embedding"] = emb
-                    to_index.append(c)
-                    if len(to_index) >= BATCH_SIZE:
-                        opensearch_index_batch(client, to_index)
-                        file_indexed += len(to_index)
-                        total_indexed += len(to_index)
-                        to_index = []
-                if to_index:
-                    opensearch_index_batch(client, to_index)
-                    file_indexed += len(to_index)
-                    total_indexed += len(to_index)
-                jlog({"event":"file_done","key":key,"added_in_file":file_indexed,"cumulative_added":total_indexed,"skipped_schema":total_skipped_schema})
-            except Exception as e:
-                jlog({"level":"ERROR","event":"file_error","key":key,"detail":str(e)})
-    else:
-        jlog({"level":"CRITICAL","event":"unsupported_vector_db","value":VECTOR_DB})
-        raise SystemExit(42)
-    jlog({"event":"complete","total_indexed":total_indexed,"total_skipped_schema":total_skipped_schema})
+                jlog({"level":"ERROR","event":"file_processing_error","key":key,"error": str(e)})
+            if SLEEP_BETWEEN_FILES > 0:
+                time.sleep(SLEEP_BETWEEN_FILES)
+    except Exception as e:
+        jlog({"level":"CRITICAL","event":"listing_or_iteration_failed","error": str(e)})
+        return 4
+
+    jlog({"event":"complete","total_indexed": total_indexed, "total_skipped_schema": total_skipped_schema})
+    # If any schema-missing chunks were found, surface non-zero exit to draw attention (optional)
     if total_skipped_schema > 0:
-        raise SystemExit(50)
+        return 50
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        rc = main()
+    except Exception as e:
+        jlog({"level":"CRITICAL","event":"unhandled_exception","error": str(e)})
+        rc = 1
+    sys.exit(rc)

@@ -1,4 +1,10 @@
-#!/usr/bin/env python3
+"""
+Idempotent web scraper:
+- Content-addressed storage: raw objects stored at <RAW_PREFIX>/<source_id>/by-hash/<sha>.<ext>
+- Single authoritative manifest per canonical URL at <RAW_PREFIX>/<source_id>/latest/<doc_id>.manifest.json
+- If manifest exists and FORCE_MANIFEST is false, the URL is skipped (no network/further writes).
+- Minimal, deterministic metadata saved in manifest: file_hash, mime_ext, original_url, timestamp, storage_url, size_bytes, remote_etag, remote_lastmod, scraper_version.
+"""
 from __future__ import annotations
 import os, sys, json, time, re, random, hashlib, tempfile, shutil, logging
 from datetime import datetime, timezone
@@ -10,12 +16,16 @@ import httpx, boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
+# optional playwright usage is allowed but not required
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
     _HAS_PLAYWRIGHT = True
 except Exception:
     _HAS_PLAYWRIGHT = False
 
+# --------------------------
+# Environment (explicit)
+# --------------------------
 SERVICE_NAME = os.getenv("SERVICE_NAME", "web_scraper_prod").strip()
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip() or None
 AWS_REGION = os.getenv("AWS_REGION", "").strip() or None
@@ -31,7 +41,7 @@ DEFAULT_CRAWL_DELAY = float(os.getenv("CRAWL_DELAY_SECONDS", "0.6"))
 RAW_DATA_PATH = os.getenv("RAW_DATA_PATH", "data/raw/").rstrip("/") + "/"
 RAW_PREFIX = os.getenv("RAW_PREFIX", "data/raw/").strip()
 ALLOWED_EXTENSIONS = [e.strip().lower() for e in os.getenv("ALLOWED_EXTENSIONS", "pdf,doc,docx,xls,xlsx,csv,html,htm,json").split(",") if e.strip()]
-MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "4"))
+MAX_CRAWL_DEPTH = int(os.getenv("MAX_CRAWL_DEPTH", "2"))
 CONCURRENT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "6"))
 SCRAPER_VERSION = os.getenv("SCRAPER_VERSION", "web_scraper@1.0.0")
 SPOOL_DIR = os.getenv("SPOOL_DIR", "/tmp/web_scraper_spool/")
@@ -40,10 +50,10 @@ MIN_HTML_BYTES = int(os.getenv("MIN_HTML_BYTES", str(2 * 1024)))
 MAX_CONTENT_BYTES = int(os.getenv("MAX_CONTENT_BYTES", str(250 * 1024 * 1024)))
 FORCE_MANIFEST = os.getenv("FORCE_MANIFEST", "false").lower() == "true"
 
+# quick guards
 if SKIP_WEB_SCRAPING:
     print(json.dumps({"ts": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"), "msg": "web_scraping_skipped", "reason": "SKIP_WEB_SCRAPING=true"}))
     sys.exit(0)
-
 if not SEED_URLS:
     sys.stderr.write("FATAL: SEED_URLS environment variable must be set (comma-separated list)\n")
     sys.exit(2)
@@ -51,6 +61,9 @@ if not S3_BUCKET:
     sys.stderr.write("FATAL: S3_BUCKET environment variable must be set\n")
     sys.exit(2)
 
+# --------------------------
+# Logging
+# --------------------------
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("web_scraper")
 
@@ -60,8 +73,11 @@ def iso_ts() -> str:
 def jlog(event: str, **fields):
     rec = {"ts": iso_ts(), "event": event}
     rec.update(fields)
-    log.info(json.dumps(rec, ensure_ascii=False, separators=(",", ":")))
+    log.info(json.dumps(rec, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
 
+# --------------------------
+# Utilities
+# --------------------------
 def _now_snapshot_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -116,7 +132,14 @@ def backoff_sleep(base: float, attempt: int, cap: float = 60.0) -> None:
     s = min(cap, base * (2 ** attempt)) * jitter
     time.sleep(s)
 
+# --------------------------
+# Storage client (idempotent boundary)
+# --------------------------
 class StorageClient:
+    """
+    - upload_binary_by_hash: stores raw bytes under by-hash key; idempotent (head-check first)
+    - write_latest_manifest: writes single manifest per doc_id (head-check first; no overwrite unless FORCE_MANIFEST)
+    """
     def __init__(self, s3_bucket: Optional[str] = None, aws_region: Optional[str] = None):
         self.s3_bucket = s3_bucket
         self.aws_region = aws_region
@@ -143,12 +166,16 @@ class StorageClient:
             return False
 
     def _by_hash_key(self, source_id: str, sha: str, ext: str) -> str:
+        # deterministic content-addressed path
         return f"{RAW_PREFIX.rstrip('/')}/{source_id}/by-hash/{sha}.{ext}"
 
     def _latest_manifest_key(self, source_id: str, doc_id: str) -> str:
         return f"{RAW_PREFIX.rstrip('/')}/{source_id}/latest/{doc_id}.manifest.json"
 
     def manifest_exists_latest(self, source_id: str, doc_id: str) -> Optional[str]:
+        """
+        Return S3 URL or local path if manifest already present (idempotency check).
+        """
         key = self._latest_manifest_key(source_id, doc_id)
         if self.s3:
             try:
@@ -163,6 +190,9 @@ class StorageClient:
             return local if os.path.exists(local) else None
 
     def read_latest_manifest(self, source_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Read and return manifest JSON dict if exists. None otherwise.
+        """
         path_or_s3 = self.manifest_exists_latest(source_id, doc_id)
         if not path_or_s3:
             return None
@@ -181,26 +211,33 @@ class StorageClient:
                 return None
 
     def upload_binary_by_hash(self, source_id: str, sha: str, ext: str, local_path: str) -> Dict[str, Any]:
+        """
+        Idempotent upload: HEAD first; if exists return metadata. On failure to upload to S3, spool locally.
+        Returns dict: storage_url, storage_etag, size_bytes
+        """
         key = self._by_hash_key(source_id, sha, ext)
         if self.s3:
             try:
-                self.s3.head_object(Bucket=self.s3_bucket, Key=key)
+                # HEAD first - idempotent check
                 head = self.s3.head_object(Bucket=self.s3_bucket, Key=key)
                 return {"storage_url": f"s3://{self.s3_bucket}/{key}", "storage_etag": head.get("ETag"), "size_bytes": head.get("ContentLength")}
             except ClientError:
+                # not present -> upload
                 try:
                     with open(local_path, "rb") as fh:
                         self.s3.upload_fileobj(fh, self.s3_bucket, key)
                     head = self.s3.head_object(Bucket=self.s3_bucket, Key=key)
                     return {"storage_url": f"s3://{self.s3_bucket}/{key}", "storage_etag": head.get("ETag"), "size_bytes": head.get("ContentLength")}
                 except Exception as e:
+                    # spool locally for later ingest if upload fails
                     try:
                         spool_name = os.path.join(self.spool_dir, f"{int(time.time())}_{Path(local_path).name}")
                         shutil.copy(local_path, spool_name)
                         jlog("s3_upload_failed_spooled", bucket=self.s3_bucket, key=key, spool=spool_name, error=str(e))
+                        return {"storage_url": spool_name, "storage_etag": None, "size_bytes": os.path.getsize(spool_name)}
                     except Exception as se:
                         jlog("s3_upload_and_spool_failed", bucket=self.s3_bucket, key=key, error=str(e), spool_error=str(se))
-                    raise
+                        raise
             except Exception as e:
                 jlog("s3_head_failed", bucket=self.s3_bucket, key=key, error=str(e))
                 raise
@@ -218,6 +255,10 @@ class StorageClient:
                 raise
 
     def write_latest_manifest(self, source_id: str, doc_id: str, manifest_obj: Dict[str, Any]) -> str:
+        """
+        Idempotent manifest write: if manifest exists and FORCE_MANIFEST is False, returns existing manifest path.
+        Otherwise writes manifest and returns path.
+        """
         key = self._latest_manifest_key(source_id, doc_id)
         if self.s3:
             try:
@@ -241,12 +282,15 @@ class StorageClient:
                 return local_path
             try:
                 with open(local_path, "w", encoding="utf-8") as fh:
-                    json.dump(manifest_obj, fh, ensure_ascii=False, indent=2)
+                    json.dump(manifest_obj, fh, ensure_ascii=False, indent=2, sort_keys=True)
                 return local_path
             except Exception as e:
                 jlog("local_manifest_write_failed", path=local_path, error=str(e))
                 raise
 
+# --------------------------
+# Robots / HTML extraction (unchanged)
+# --------------------------
 class RobotsCache:
     def __init__(self, http: httpx.Client, ua: str):
         self._http = http
@@ -351,6 +395,9 @@ class SimpleHTMLExtractor:
             return float("inf") if link_count > 0 else 0.0
         return link_count / max(1, words)
 
+# --------------------------
+# WebScraper (enforces idempotency)
+# --------------------------
 class WebScraper:
     def __init__(self, storage: StorageClient):
         self.storage = storage
@@ -438,14 +485,24 @@ class WebScraper:
             pass
         return status, headers_out, tmpf_path, final_url, captured
 
-    def _emit_pdf_manifest(self, source_host: str, file_path: str, original_url: str) -> Optional[Dict[str, Any]]:
+    def _emit_pdf_manifest(self, source_host: str, file_path: str, original_url: str, remote_etag: Optional[str], remote_lastmod: Optional[str]) -> Optional[Dict[str, Any]]:
         try:
             raw_sha = _compute_sha256_file(file_path)
             size_bytes = os.path.getsize(file_path)
             ext = "pdf"
             source_id = f"{source_host}_{hashlib.sha256(original_url.encode()).hexdigest()[:12]}"
             upload_meta = self.storage.upload_binary_by_hash(source_id, raw_sha, ext, file_path)
-            minimal_manifest = {"file_hash": raw_sha, "mime_ext": ext, "original_url": original_url, "timestamp": iso_ts()}
+            minimal_manifest = {
+                "file_hash": raw_sha,
+                "mime_ext": ext,
+                "original_url": original_url,
+                "timestamp": iso_ts(),
+                "storage_url": upload_meta.get("storage_url"),
+                "size_bytes": upload_meta.get("size_bytes"),
+                "remote_etag": remote_etag,
+                "remote_lastmod": remote_lastmod,
+                "scraper_version": SCRAPER_VERSION
+            }
             manifest_path = self.storage.write_latest_manifest(source_id, hashlib.sha256(_canonicalize_url(original_url).encode()).hexdigest(), minimal_manifest)
             self.metrics["manifests_written"] += 1
             self.metrics["bytes_ingested"] += size_bytes
@@ -456,6 +513,14 @@ class WebScraper:
             return None
 
     def _process_fetch(self, url: str, depth: int = 0, parent: Optional[str] = None, force: bool = False) -> Dict[str, Any]:
+        """
+        Strictly idempotent control flow:
+        1) compute canonical + doc_id + source_id
+        2) if manifest exists and not FORCE_MANIFEST -> skip (no network writes)
+        3) perform HEAD; if HEAD indicates 304/unchanged via ETag/Last-Modified compared to manifest -> skip
+        4) fetch body; compute sha; if sha equals existing manifest.file_hash -> do not create new by-hash object or manifest (but ensure storage_url present)
+        5) otherwise, upload by-hash and write latest manifest atomically (head-check then put)
+        """
         if self._time_exceeded():
             return {"url": url, "error": "time_exceeded"}
         self.metrics["fetch_attempts"] += 1
@@ -463,55 +528,79 @@ class WebScraper:
             return {"url": url, "error": "disk_low"}
         canonical = _canonicalize_url(url)
         if self._seen_and_record(canonical):
-            return {"url": url, "skipped": True}
+            return {"url": url, "skipped": True, "reason": "seen_in_run"}
         if not is_allowed_domain(url):
             jlog("domain_not_allowed", url=url)
             return {"url": url, "error": "domain_not_allowed"}
         doc_id = hashlib.sha256(canonical.encode()).hexdigest()
         source_host = (urlparse(url).hostname or "unknown")
-        preexist = self.storage.manifest_exists_latest(f"{source_host}_{doc_id[:12]}", doc_id)
-        if preexist and not force:
-            jlog("skip_existing_latest_manifest", url=canonical, doc_id=doc_id, manifest=preexist)
-            return {"url": url, "skipped": True}
+        source_id = f"{source_host}_{doc_id[:12]}"
+
+        # --- Early idempotency check: existing manifest
+        existing_manifest = self.storage.read_latest_manifest(source_id, doc_id)
+        if existing_manifest and not force and not FORCE_MANIFEST:
+            # Manifest exists — do not re-fetch unless forced.
+            jlog("skip_existing_manifest", url=canonical, doc_id=doc_id, reason="manifest_present", manifest_summary={
+                "file_hash": existing_manifest.get("file_hash"),
+                "storage_url": existing_manifest.get("storage_url"),
+                "remote_etag": existing_manifest.get("remote_etag"),
+                "remote_lastmod": existing_manifest.get("remote_lastmod"),
+                "timestamp": existing_manifest.get("timestamp")
+            })
+            return {"url": url, "skipped": True, "reason": "manifest_present"}
+
+        # check robots
         if not self.robots.allowed(url):
             jlog("robots_disallowed", url=url)
             return {"url": url, "error": "robots_disallow"}
+
+        # enforce crawl delay per-origin
         self._enforce_crawl_delay(url)
+
+        # HEAD to detect changes if a manifest exists (best-effort)
         head_status, head_headers = self._head(url)
         head_etag = (head_headers or {}).get("etag") if head_headers else None
         head_lastmod = (head_headers or {}).get("last-modified") if head_headers else None
+
+        # If we have an existing manifest and the HEAD info matches, skip fetching
+        if existing_manifest and not force:
+            if head_status == 304:
+                jlog("skip_not_modified_304", url=canonical, doc_id=doc_id)
+                return {"url": url, "skipped": True, "reason": "not_modified_304"}
+            if head_etag and existing_manifest.get("remote_etag") and head_etag == existing_manifest.get("remote_etag"):
+                jlog("skip_etag_match", url=canonical, doc_id=doc_id, etag=head_etag)
+                return {"url": url, "skipped": True, "reason": "etag_match"}
+            if head_lastmod and existing_manifest.get("remote_lastmod") and head_lastmod == existing_manifest.get("remote_lastmod"):
+                jlog("skip_lastmod_match", url=canonical, doc_id=doc_id, lastmod=head_lastmod)
+                return {"url": url, "skipped": True, "reason": "lastmod_match"}
+
+        # Fetch with retries
         attempts_meta = []
         attempt = 0
         last_exc = None
-        prefer_browser = False
-        try:
-            host = urlparse(url).hostname or ""
-            if host and any(host.endswith(d) for d in ALLOWED_DOMAINS):
-                prefer_browser = False
-        except Exception:
-            prefer_browser = False
         while attempt <= HTTP_RETRIES:
             if self._time_exceeded():
                 return {"url": url, "error": "time_exceeded"}
             attempt += 1
             start_at = datetime.now(timezone.utc)
             tmpf_path = None
-            captured_network_files = []
             try:
                 get_headers = {"User-Agent": HTTP_USER_AGENT}
+                # conditional GET using HEAD values where available
                 if head_etag:
                     get_headers["If-None-Match"] = head_etag
                 if head_lastmod:
                     get_headers["If-Modified-Since"] = head_lastmod
                 status, headers, tmpf_path, final_url, captured_network_files = self._static_fetch_to_file(url, headers=get_headers)
                 if status == 304:
-                    jlog("not_modified", url=url)
+                    jlog("not_modified_304_after_get", url=url)
                     try:
                         if tmpf_path and os.path.exists(tmpf_path):
                             os.unlink(tmpf_path)
                     except Exception:
                         pass
-                    return {"url": url, "skipped": True}
+                    # if manifest exists we already returned above; here manifest may not exist but server says not modified -> skip
+                    return {"url": url, "skipped": True, "reason": "not_modified_304"}
                 raw_sha256 = _compute_sha256_file(tmpf_path)
                 if raw_sha256 in self.seen_hashes:
                     try:
@@ -520,28 +609,69 @@ class WebScraper:
                     except Exception:
                         pass
                     jlog("duplicate_in_run_skipped", url=url, sha256=raw_sha256)
-                    return {"url": url, "skipped": True}
+                    return {"url": url, "skipped": True, "reason": "duplicate_in_run", "sha256": raw_sha256}
                 self.seen_hashes.add(raw_sha256)
                 size_bytes = os.path.getsize(tmpf_path)
                 attempts_meta.append({"started_at": start_at.isoformat().replace("+00:00", "Z"), "finished_at": iso_ts(), "status_code": status, "bytes_received": size_bytes, "error": None})
                 ext = _ext_from_url_or_ct(final_url, headers.get("content-type"))
                 safe_name = _safe_name_from_url(final_url, ext)
-                upload_meta = self.storage.upload_binary_by_hash(f"{source_host}_{doc_id[:12]}", raw_sha256, ext, tmpf_path)
-                minimal_manifest = {"file_hash": raw_sha256, "mime_ext": ext or "", "original_url": final_url, "timestamp": iso_ts()}
+
+                # If an existing manifest exists and the raw sha matches, ensure storage URL recorded; don't reupload
+                if existing_manifest and existing_manifest.get("file_hash") == raw_sha256:
+                    jlog("content_unchanged_sha_matches", url=canonical, doc_id=doc_id, sha=raw_sha256)
+                    # If storage_url missing, attempt to ensure the by-hash object exists and write storage_url into manifest if missing
+                    if not existing_manifest.get("storage_url"):
+                        try:
+                            upload_meta = self.storage.upload_binary_by_hash(source_id, raw_sha256, ext, tmpf_path)
+                            existing_manifest["storage_url"] = upload_meta.get("storage_url")
+                            existing_manifest["size_bytes"] = upload_meta.get("size_bytes")
+                            existing_manifest["remote_etag"] = head_etag
+                            existing_manifest["remote_lastmod"] = head_lastmod
+                            existing_manifest["timestamp"] = iso_ts()
+                            # attempt to write manifest if absent (idempotent write)
+                            manifest_path = self.storage.write_latest_manifest(source_id, doc_id, existing_manifest)
+                            self.metrics["manifests_written"] += 1
+                            jlog("manifest_fixed_storage_url", url=canonical, doc_id=doc_id, manifest_path=manifest_path)
+                        except Exception as e:
+                            jlog("fix_manifest_storage_failed", url=canonical, error=str(e))
+                    try:
+                        if tmpf_path and os.path.exists(tmpf_path):
+                            os.unlink(tmpf_path)
+                    except Exception:
+                        pass
+                    self.metrics["fetch_success"] += 1
+                    return {"url": url, "skipped": True, "reason": "sha_matches_existing_manifest", "sha256": raw_sha256}
+
+                # Otherwise, upload content to by-hash and write new manifest
+                upload_meta = self.storage.upload_binary_by_hash(source_id, raw_sha256, ext, tmpf_path)
+                minimal_manifest = {
+                    "file_hash": raw_sha256,
+                    "mime_ext": ext or "",
+                    "original_url": final_url,
+                    "timestamp": iso_ts(),
+                    "storage_url": upload_meta.get("storage_url"),
+                    "size_bytes": upload_meta.get("size_bytes"),
+                    "remote_etag": headers.get("etag") if headers else None,
+                    "remote_lastmod": headers.get("last-modified") if headers else None,
+                    "scraper_version": SCRAPER_VERSION
+                }
                 try:
+                    # validate minimal manifest before writing
                     manifest_validator_minimal(minimal_manifest)
                 except Exception as e:
                     jlog("manifest_validation_failed", url=final_url, error=str(e))
-                manifest_path = self.storage.write_latest_manifest(f"{source_host}_{doc_id[:12]}", doc_id, minimal_manifest)
+                manifest_path = self.storage.write_latest_manifest(source_id, doc_id, minimal_manifest)
                 self.metrics["fetch_success"] += 1
                 self.metrics["bytes_ingested"] += upload_meta.get("size_bytes", 0) or 0
                 self.metrics["manifests_written"] += 1
+
+                # extract links for discovery when HTML
                 candidate_links = []
                 ct = headers.get("content-type") if headers else ""
                 is_html = ("text/html" in (ct or "")) or safe_name.lower().endswith((".html", ".htm", "response.html"))
                 if is_html:
                     try:
-                        with open(tmpf_path, "rb") as fh:
+                        with open(upload_meta.get("storage_url") if not self.storage.s3 and upload_meta.get("storage_url") else tmpf_path, "rb") as fh:
                             text = fh.read().decode(errors="replace")
                         extractor = SimpleHTMLExtractor(final_url)
                         extractor.feed(text)
@@ -571,12 +701,21 @@ class WebScraper:
                             candidate_links.append(urljoin(final_url, m.group(1)))
                     except Exception:
                         pass
-                jlog("fetch_and_commit_success", url=url, file_path=upload_meta.get("storage_url"), manifest_path=manifest_path, sha256=raw_sha256, links=len(candidate_links))
+
+                jlog("fetch_and_commit_success",
+                     url=url,
+                     final_url=final_url,
+                     file_path=upload_meta.get("storage_url"),
+                     manifest_path=manifest_path,
+                     sha256=raw_sha256,
+                     links=len(candidate_links))
+                # cleanup local temp file if by-hash moved it (local mode) or if upload completed
                 try:
                     if tmpf_path and os.path.exists(tmpf_path):
                         os.unlink(tmpf_path)
                 except Exception:
                     pass
+
                 prioritized = []
                 next_discovery = []
                 for l in candidate_links:
@@ -635,6 +774,9 @@ class WebScraper:
                                         discovery_queue.append((l, depth + 1))
             jlog("pipeline_complete", metrics=self.metrics, elapsed_seconds=int(time.time()-self.start_time))
 
+# --------------------------
+# Validation helpers
+# --------------------------
 def manifest_validator_minimal(man: Dict[str, Any]) -> None:
     required = ["file_hash", "mime_ext", "original_url", "timestamp"]
     missing = [k for k in required if k not in man]
@@ -671,6 +813,9 @@ def is_allowed_domain(url: str) -> bool:
     except Exception:
         return False
 
+# --------------------------
+# Main
+# --------------------------
 def main() -> int:
     storage = StorageClient(s3_bucket=S3_BUCKET, aws_region=AWS_REGION)
     if S3_BUCKET and not storage.preflight_s3_access():
