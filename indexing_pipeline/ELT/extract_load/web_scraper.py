@@ -11,7 +11,9 @@ Design invariants (enforced here):
   file_hash, mime_ext, original_url, timestamp, storage_url, size_bytes, remote_etag, remote_lastmod, scraper_version.
 - All writes are idempotent / guarded by HEAD checks on S3 (or local filesystem existence).
 """
+
 from __future__ import annotations
+import re
 import os
 import sys
 import json

@@ -26,7 +26,7 @@ jobs:
       - name: Build & push indexing image
         env:
           IMAGE_NAME: civic-indexing
-          IMAGE_TAG: amd64-arm64-v8
+          IMAGE_TAG: amd64-arm64-v9
 
           # ---- build config ----
           PLATFORMS: linux/amd64,linux/arm64

@@ -4,8 +4,6 @@
 # - Builds multi-arch images with docker buildx
 # - Skips push when remote tag already exists (best-effort)
 # - Keeps logic testable and runnable locally
-set -euo pipefail
-
 # -------------------------
 # Configurable inputs (via env or defaults)
 # -------------------------
