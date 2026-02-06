@@ -17,8 +17,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # Required for multi-arch buildx
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
 
@@ -27,9 +25,8 @@ jobs:
 
       - name: Build & push indexing image
         env:
-          # ---- image identity ----
           IMAGE_NAME: civic-indexing
-          IMAGE_TAG: amd64-arm64-v7
+          IMAGE_TAG: amd64-arm64-v8
 
           # ---- build config ----
           PLATFORMS: linux/amd64,linux/arm64
