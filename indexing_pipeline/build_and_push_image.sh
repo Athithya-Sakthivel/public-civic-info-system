@@ -10,7 +10,7 @@ set -euo pipefail
 # Configurable inputs (via env or defaults)
 # -------------------------
 IMAGE_NAME="${IMAGE_NAME:-civic-indexing}"
-IMAGE_TAG="${IMAGE_TAG:-amd64-arm64-v5}"
+IMAGE_TAG="${IMAGE_TAG:-amd64-arm64-v6}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-./indexing_pipeline}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-${BUILD_CONTEXT}/Dockerfile}"
 
@@ -18,11 +18,9 @@ DOCKERFILE_PATH="${DOCKERFILE_PATH:-${BUILD_CONTEXT}/Dockerfile}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 LOCAL_PLATFORM="${LOCAL_PLATFORM:-linux/amd64}"
 
-# Build args / labels
 OCR_LANGUAGES="${OCR_LANGUAGES:-eng,tam,hin}"
 INDIC_OCR_SIZE="${INDIC_OCR_SIZE:-best}"
 
-# Push / registry selection
 PUSH="$(printf '%s' "${PUSH:-true}" | tr '[:upper:]' '[:lower:]')"
 REGISTRY_TYPE="${REGISTRY_TYPE:-dockerhub}"   # dockerhub | ecr
 ECR_REPO="${ECR_REPO:-}"                      # full ECR repo if using ecr (e.g. 123.dkr.ecr.region.amazonaws.com/repo)
