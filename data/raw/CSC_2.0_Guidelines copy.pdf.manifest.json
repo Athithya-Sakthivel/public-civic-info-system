@@ -2,9 +2,9 @@
   "file_hash": "48a4032e595e74cf457e742b19eebb9697c14ecaee8a598f108959d65c9d8253",
   "mime_ext": "pdf",
   "parser_version": "router-v1",
-  "pipeline_run_id": "1770338921",
+  "pipeline_run_id": "1770367755",
   "s3_key": "data/raw/CSC_2.0_Guidelines copy.pdf",
   "s3_url": "s3://civic-data-raw-prod/data/raw/CSC_2.0_Guidelines copy.pdf",
   "saved_chunks": 0,
-  "timestamp": "2026-02-06T00:48:42.086Z"
+  "timestamp": "2026-02-06T08:49:16.344Z"
 }

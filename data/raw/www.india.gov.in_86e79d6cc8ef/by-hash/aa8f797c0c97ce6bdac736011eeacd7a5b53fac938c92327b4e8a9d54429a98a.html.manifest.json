@@ -1,0 +1,10 @@
+{
+  "file_hash": "aa8f797c0c97ce6bdac736011eeacd7a5b53fac938c92327b4e8a9d54429a98a",
+  "mime_ext": "html",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1770367755",
+  "s3_key": "data/raw/www.india.gov.in_86e79d6cc8ef/by-hash/aa8f797c0c97ce6bdac736011eeacd7a5b53fac938c92327b4e8a9d54429a98a.html",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/www.india.gov.in_86e79d6cc8ef/by-hash/aa8f797c0c97ce6bdac736011eeacd7a5b53fac938c92327b4e8a9d54429a98a.html",
+  "saved_chunks": 1,
+  "timestamp": "2026-02-06T08:49:27.039Z"
+}

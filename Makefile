@@ -1,8 +1,3 @@
-
-
-
-
-
 # Makefile to package all Lambdas with scripts/package_lambda.sh
 ARTIFACTS_DIR ?= artifacts
 
@@ -110,11 +105,6 @@ pulumi-up:
 	bash infra/pulumi_aws/run.sh create
 
 pi:
-	git add indexing_pipeline
+	git add .github/workflows/indexing.yaml indexing_pipeline
 	git commit -m "indexing pipeline update"
-	git push origin main
-
-pci:
-	git add .github
-	git commit -m ".github/ files update"
 	git push origin main

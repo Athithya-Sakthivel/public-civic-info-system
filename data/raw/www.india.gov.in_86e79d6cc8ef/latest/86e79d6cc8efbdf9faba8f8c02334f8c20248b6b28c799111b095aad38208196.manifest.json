@@ -1,1 +1,11 @@
-{"file_hash": "4e6413828e6f514e4a7fc67eb8e7a3aafef2ddb2a58d3f0a303d3c9fcbdfa795", "mime_ext": "html", "original_url": "https://www.india.gov.in/my-government/schemes", "timestamp": "2026-02-06T00:11:39.243967Z", "storage_url": "s3://civic-data-raw-prod/data/raw/www.india.gov.in_86e79d6cc8ef/by-hash/4e6413828e6f514e4a7fc67eb8e7a3aafef2ddb2a58d3f0a303d3c9fcbdfa795.html", "size_bytes": 401, "remote_etag": null, "remote_lastmod": null, "scraper_version": "web_scraper@1.0.0"}
+{
+  "file_hash": "aa8f797c0c97ce6bdac736011eeacd7a5b53fac938c92327b4e8a9d54429a98a",
+  "mime_ext": "html",
+  "original_url": "https://www.india.gov.in/my-government/schemes",
+  "remote_etag": null,
+  "remote_lastmod": null,
+  "scraper_version": "web_scraper@1.0.0",
+  "size_bytes": 401,
+  "storage_url": "s3://civic-data-raw-prod/data/raw/www.india.gov.in_86e79d6cc8ef/by-hash/aa8f797c0c97ce6bdac736011eeacd7a5b53fac938c92327b4e8a9d54429a98a.html",
+  "timestamp": "2026-02-06T08:49:14.532685Z"
+}
