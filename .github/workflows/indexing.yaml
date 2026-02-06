@@ -29,7 +29,7 @@ jobs:
         env:
           # ---- image identity ----
           IMAGE_NAME: civic-indexing
-          IMAGE_TAG: amd64-arm64-v4
+          IMAGE_TAG: amd64-arm64-v7
 
           # ---- build config ----
           PLATFORMS: linux/amd64,linux/arm64
