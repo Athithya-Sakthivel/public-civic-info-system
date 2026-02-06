@@ -1,0 +1,10 @@
+{
+  "file_hash": "8eb35691c4779319606c23c53f58d30dff33107e0c6df496fb7d763f5b3e0aad",
+  "mime_ext": "html",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1770338921",
+  "s3_key": "data/raw/pmkisan.gov.in_263c769c3b54/20260206T000510Z/response.html",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/pmkisan.gov.in_263c769c3b54/20260206T000510Z/response.html",
+  "saved_chunks": 0,
+  "timestamp": "2026-02-06T00:48:52.694Z"
+}

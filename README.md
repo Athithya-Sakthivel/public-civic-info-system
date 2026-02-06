@@ -17,14 +17,14 @@ export FRONTEND_UI_BUCKET="civic-bucket-for-ui"          # S3 bucket hosting the
 
 make create-s3
 make upload-force
-export SKIP_WEB_SCRAPING=true && make ELT
+export SKIP_WEB_SCRAPING=false && make ELT
+
 
 # export SEED_URLS="https://www.india.gov.in/my-government/schemes,https://www.myscheme.gov.in,https://csc.gov.in"  # Authoritative seed entry points 
 # export ALLOWED_DOMAINS="india.gov.in,myscheme.gov.in,csc.gov.in"  # Strict allowlist of domains permitted during crawling
 # export SKIP_WEB_SCRAPING=false
 
 ```
-
 
 
 

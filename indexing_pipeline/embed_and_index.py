@@ -145,7 +145,6 @@ def ensure_schema(conn):
         """
         cur.execute(create_table_sql)
         # indexes
-        # HNSW index for cosine (requires pgvector >= 0.6)
         cur.execute(f"""
         DO $$
         BEGIN
@@ -316,7 +315,6 @@ def pg_insert_batch(conn, docs: List[Dict[str, Any]]):
     with conn.cursor() as cur:
         for d in docs:
             emb = d["embedding"]
-            # safe formatting for embedding vector literal: use array string then cast
             emb_str = "[" + ",".join(map(str, emb)) + "]"
             meta_json = json.dumps(d.get("meta") or {})
             try:
@@ -342,7 +340,6 @@ def pg_insert_batch(conn, docs: List[Dict[str, Any]]):
 def process_s3_file(conn, bucket: str, key: str):
     jlog({"event":"processing_s3_object","key":key})
     stream = stream_jsonl_from_s3(bucket, key)
-    batch_to_embed: List[Dict[str, Any]] = []
     pending_normalized: List[Dict[str, Any]] = []
     total_added_in_file = 0
     total_skipped_schema = 0
@@ -353,12 +350,10 @@ def process_s3_file(conn, bucket: str, key: str):
             total_skipped_schema += 1
             continue
         pending_normalized.append(normalized)
-        # flush when we have BATCH_SIZE candidates
         if len(pending_normalized) >= BATCH_SIZE:
             added = process_batch(conn, pending_normalized)
             total_added_in_file += added
             pending_normalized = []
-    # final flush
     if pending_normalized:
         added = process_batch(conn, pending_normalized)
         total_added_in_file += added
@@ -367,7 +362,6 @@ def process_s3_file(conn, bucket: str, key: str):
     return total_added_in_file, total_skipped_schema
 
 def process_batch(conn, normalized_list: List[Dict[str, Any]]):
-    # 1) gather chunk_ids and pre-check DB to avoid unnecessary embedding
     chunk_ids = [n["chunk_id"] for n in normalized_list]
     existing = pg_existing_chunk_ids(conn, chunk_ids)
     to_process = [n for n in normalized_list if n["chunk_id"] not in existing]
@@ -377,14 +371,12 @@ def process_batch(conn, normalized_list: List[Dict[str, Any]]):
     if not to_process:
         return 0
 
-    # 2) call embedding model in per-item manner (could be parallelized but keep sequential for determinism)
     docs_for_insert = []
     for n in to_process:
         try:
             emb = get_embedding_from_bedrock(n["content"])
         except Exception as e:
             jlog({"level":"ERROR","event":"embedding_failed","chunk_id": n["chunk_id"], "error": str(e)})
-            # skip this chunk to avoid blocking whole batch; continue with others
             continue
         doc = {
             "chunk_id": n["chunk_id"],
@@ -403,7 +395,6 @@ def process_batch(conn, normalized_list: List[Dict[str, Any]]):
         jlog({"event":"batch_all_embeddings_failed_or_empty"})
         return 0
 
-    # 3) insert into PG (ON CONFLICT DO NOTHING ensures idempotence)
     inserted = 0
     try:
         inserted = pg_insert_batch(conn, docs_for_insert)
@@ -415,7 +406,6 @@ def process_batch(conn, normalized_list: List[Dict[str, Any]]):
 
 def main() -> int:
     jlog({"event":"startup","s3_bucket": S3_BUCKET, "s3_prefix": S3_PREFIX})
-    # Preflight S3 access
     try:
         s3.head_bucket(Bucket=S3_BUCKET)
     except Exception as e:
@@ -443,7 +433,6 @@ def main() -> int:
         return 4
 
     jlog({"event":"complete","total_indexed": total_indexed, "total_skipped_schema": total_skipped_schema})
-    # If any schema-missing chunks were found, surface non-zero exit to draw attention (optional)
     if total_skipped_schema > 0:
         return 50
     return 0

@@ -1,0 +1,10 @@
+{
+  "error": "read_failed: An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist.",
+  "file_hash": null,
+  "mime_ext": "php",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1770336070",
+  "s3_key": "data/raw/www.tn.gov.in_11778da9f935/20260205T123937Z/schemes.php",
+  "timestamp": "2026-02-06T00:04:20.132Z",
+  "traceback": "Traceback (most recent call last):\n  File \"/app/ELT/parse_chunk_store/router.py\", line 261, in main\n    raw_bytes = backend.open_read(s3_key)\n                ^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/app/ELT/parse_chunk_store/router.py\", line 91, in open_read\n    resp = self.s3.get_object(Bucket=self.bucket, Key=key)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.11/site-packages/botocore/client.py\", line 602, in _api_call\n    return self._make_api_call(operation_name, kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.11/site-packages/botocore/context.py\", line 123, in wrapper\n    return func(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/lib/python3.11/site-packages/botocore/client.py\", line 1078, in _make_api_call\n    raise error_class(parsed_response, operation_name)\nbotocore.errorfactory.NoSuchKey: An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist.\n"
+}

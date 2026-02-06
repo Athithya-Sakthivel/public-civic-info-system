@@ -1,0 +1,10 @@
+{
+  "file_hash": "32671629faffb92a04e7d4a00ad4105983dc5e8a5b14573cb6088eb10836699c",
+  "mime_ext": "",
+  "parser_version": "router-v1",
+  "pipeline_run_id": "1770338921",
+  "s3_key": "data/raw/www.india.gov.in_86e79d6cc8ef/20260206T001136Z/schemes",
+  "s3_url": "s3://civic-data-raw-prod/data/raw/www.india.gov.in_86e79d6cc8ef/20260206T001136Z/schemes",
+  "saved_chunks": 0,
+  "timestamp": "2026-02-06T00:49:11.851Z"
+}

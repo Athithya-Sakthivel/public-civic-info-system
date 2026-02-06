@@ -2,6 +2,14 @@
 """
 Router that enumerates raw files (S3 or local FS), dispatches to format-specific
 parsers, records manifests, and ensures idempotency.
+
+Notes / fixes:
+- Normalizes STORAGE env for downstream parser modules: router accepts 's3' or 'fs'
+  but parser modules expect 's3' or 'local'. We set os.environ["STORAGE"] = 'local'
+  when router STORAGE == 'fs' so pdf/html modules import cleanly (prevents pdf being skipped).
+- load_local_module searches for both "<name>.py" and "_<name>.py" as before.
+- Improved FS listing to include RAW_PREFIX as fallback, and safer path handling.
+- Deterministic manifest writes (sort_keys=True) and consistent logging.
 """
 from __future__ import annotations
 import os
@@ -35,7 +43,8 @@ def log(level: str, event: str, **extra):
     else:
         print(line, flush=True)
 
-STORAGE = os.getenv("STORAGE", "s3").strip().lower()
+# Router-level configuration
+STORAGE = os.getenv("STORAGE", "s3").strip().lower()   # accepted: 's3' or 'fs'
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
 AWS_REGION = os.getenv("AWS_REGION", "").strip()
 RAW_PREFIX = (os.getenv("RAW_PREFIX") or os.getenv("STORAGE_RAW_PREFIX") or "data/raw/").rstrip("/") + "/"
@@ -43,11 +52,20 @@ CHUNKED_PREFIX = (os.getenv("CHUNKED_PREFIX") or os.getenv("STORAGE_CHUNKED_PREF
 PARSER_VERSION = os.getenv("PARSER_VERSION", "router-v1")
 FORCE_PROCESS = os.getenv("FORCE_PROCESS", "false").lower() == "true"
 
-if STORAGE not in ("s3", "fs"):
-    log("error", "config", msg=f"Unsupported STORAGE='{STORAGE}'. Use 's3' or 'fs'.")
+# Accept both "fs" (router-friendly) and "local" (parser modules)
+if STORAGE not in ("s3", "fs", "local"):
+    log("error", "config", msg=f"Unsupported STORAGE='{STORAGE}'. Use 's3' or 'fs' (or 'local').")
     sys.exit(2)
 
-if STORAGE == "s3" and not S3_BUCKET:
+# For downstream parser modules (pdf.py, _html.py, etc.) expect STORAGE to be 's3' or 'local'.
+# If router was configured 'fs', export STORAGE='local' so those modules validate correctly.
+if STORAGE == "fs":
+    os.environ["STORAGE"] = "local"
+else:
+    os.environ["STORAGE"] = STORAGE
+
+# Validate S3 config when needed
+if os.environ["STORAGE"] == "s3" and not S3_BUCKET:
     log("error", "config", msg="S3_BUCKET must be set when STORAGE='s3'")
     sys.exit(2)
 
@@ -72,6 +90,7 @@ class S3Backend(StorageBackend):
             raise SystemExit(2)
         self.bucket = bucket
         self.s3 = boto3.client("s3", region_name=region or None)
+
     def list_raw(self, prefix: str) -> List[str]:
         out: List[str] = []
         paginator = self.s3.get_paginator("list_objects_v2")
@@ -81,40 +100,63 @@ class S3Backend(StorageBackend):
                 if key and not key.endswith(".manifest.json"):
                     out.append(key)
         return out
+
     def exists(self, key: str) -> bool:
         try:
             self.s3.head_object(Bucket=self.bucket, Key=key)
             return True
         except Exception:
             return False
+
     def open_read(self, key: str):
         resp = self.s3.get_object(Bucket=self.bucket, Key=key)
         return resp["Body"].read()
+
     def write_bytes_atomic(self, key: str, data: bytes) -> None:
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=data)
+
     def write_text_atomic(self, key: str, text: str) -> None:
         self.write_bytes_atomic(key, text.encode("utf-8"))
 
 class FSBackend(StorageBackend):
     def __init__(self, root_fs_prefix: str = ""):
-        self.root_prefix = root_fs_prefix.rstrip("/") + "/"
+        # root_fs_prefix unused for now; using absolute/relative paths as-is
+        self.root_prefix = root_fs_prefix.rstrip("/") + "/" if root_fs_prefix else ""
+
     def _full(self, rel: str) -> str:
+        # return normalized POSIX path (relative or absolute)
         return str(Path(rel).as_posix())
+
     def list_raw(self, prefix: str) -> List[str]:
         base = Path(prefix)
         out: List[str] = []
         if not base.exists():
-            return out
+            # Try prefix relative to cwd
+            base = Path(".") / prefix
+            if not base.exists():
+                return out
         for p in base.rglob("*"):
             if p.is_file() and not p.name.endswith(".manifest.json"):
-                out.append(str(p.relative_to(Path(".")).as_posix()))
+                # return path relative to cwd for consistent keys
+                try:
+                    out.append(str(p.relative_to(Path(".")).as_posix()))
+                except Exception:
+                    out.append(str(p.as_posix()))
         return out
+
     def exists(self, relpath: str) -> bool:
         return Path(relpath).exists()
+
     def open_read(self, relpath: str):
         p = Path(relpath)
+        if not p.exists():
+            # try under RAW_PREFIX
+            candidate = Path(RAW_PREFIX) / p.name
+            if candidate.exists():
+                p = candidate
         with p.open("rb") as f:
             return f.read()
+
     def write_bytes_atomic(self, relpath: str, data: bytes) -> None:
         p = Path(relpath)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -124,10 +166,12 @@ class FSBackend(StorageBackend):
             f.flush()
             os.fsync(f.fileno())
         tmp.replace(p)
+
     def write_text_atomic(self, relpath: str, text: str) -> None:
         self.write_bytes_atomic(relpath, text.encode("utf-8"))
 
-if STORAGE == "s3":
+# Instantiate backend
+if os.environ["STORAGE"] == "s3":
     backend = S3Backend(S3_BUCKET, region=AWS_REGION or None)
     STORAGE_ROOT = f"s3://{S3_BUCKET}/"
 else:
@@ -178,6 +222,10 @@ def make_fallback_parser(module_name: str, trace: Optional[str] = None):
     return ns
 
 def load_local_module(mod_name: str):
+    """
+    Load module from same directory as this router file. Try <mod_name>.py then _<mod_name>.py.
+    Cache loaded modules. On import errors return fallback parser (with traceback in manifest).
+    """
     if mod_name in MODULE_CACHE:
         return MODULE_CACHE[mod_name]
     candidates = [f"{mod_name}.py", f"_{mod_name}.py"]
@@ -189,6 +237,7 @@ def load_local_module(mod_name: str):
             if spec and spec.loader:
                 mod = importlib.util.module_from_spec(spec)
                 try:
+                    # Important: module import may read os.environ["STORAGE"] so we ensured it above.
                     spec.loader.exec_module(mod)  # type: ignore
                     MODULE_CACHE[mod_name] = mod
                     log("info", "module_loaded", module=mod_name, path=str(mod_path))
@@ -207,7 +256,7 @@ def is_already_processed(file_hash: str) -> bool:
         return False
     prefix = f"{CHUNKED_PREFIX}{file_hash}"
     try:
-        if STORAGE == "s3":
+        if os.environ["STORAGE"] == "s3":
             paginator = backend.s3.get_paginator("list_objects_v2")
             for page in paginator.paginate(Bucket=backend.bucket, Prefix=prefix.lstrip("/"), PaginationConfig={"MaxItems": 1}):
                 if page.get("KeyCount", 0) > 0 or page.get("Contents"):
@@ -245,9 +294,9 @@ def sniff_format_from_bytes(b: bytes) -> Optional[str]:
 def main():
     run_id = os.getenv("RUN_ID") or str(int(time.time()))
     parser_version = PARSER_VERSION
-    log("info", "startup", storage=STORAGE, raw_prefix=RAW_PREFIX, chunked_prefix=CHUNKED_PREFIX, run_id=run_id)
+    log("info", "startup", storage=os.environ["STORAGE"], raw_prefix=RAW_PREFIX, chunked_prefix=CHUNKED_PREFIX, run_id=run_id)
     try:
-        keys = backend.list_raw(RAW_PREFIX.lstrip("/") if STORAGE == "s3" else RAW_PREFIX)
+        keys = backend.list_raw(RAW_PREFIX.lstrip("/") if os.environ["STORAGE"] == "s3" else RAW_PREFIX)
     except Exception as e:
         log("error", "list_raw_failed", error=str(e))
         sys.exit(1)
@@ -291,9 +340,11 @@ def main():
                 save_manifest(s3_key, manifest)
                 log("error", "hash_failed", key=s3_key, error=str(e))
                 continue
+
             if is_already_processed(file_hash):
                 log("info", "skip_already_processed", file_hash=file_hash, key=s3_key)
                 continue
+
             ext = detect_ext_from_key(s3_key)
             module_name = FORMAT_MAP.get(ext)
             if not module_name:
@@ -306,7 +357,10 @@ def main():
                     else:
                         log("warn", "unsupported_ext", key=s3_key, ext=ext)
                         module_name = "unsupported"
+
+            # Ensure module import sees storage environment that parser expects (already set above).
             mod = load_local_module(module_name)
+
             ts = now_ts()
             manifest: Dict[str, Any] = {
                 "file_hash": file_hash,
@@ -316,6 +370,7 @@ def main():
                 "timestamp": ts,
                 "parser_version": parser_version,
             }
+
             try:
                 result = mod.parse_file(s3_key, manifest)
                 if not isinstance(result, dict) or "saved_chunks" not in result:
@@ -327,14 +382,16 @@ def main():
                 save_manifest(s3_key, manifest)
                 log("error", "parse_failed", key=s3_key, error=str(e))
                 continue
+
             saved = int(result.get("saved_chunks", 0) or 0)
             manifest["saved_chunks"] = saved
-            if STORAGE == "s3":
+            if os.environ["STORAGE"] == "s3":
                 manifest["s3_url"] = f"s3://{S3_BUCKET}/{s3_key}"
             else:
                 manifest["local_path"] = s3_key
             save_manifest(s3_key, manifest)
             log("info", "parsed", key=s3_key, saved_chunks=saved, file_hash=file_hash)
+
         except Exception as exc:
             tb = traceback.format_exc()
             log("error", "outer_loop_exception", key=s3_key if 's3_key' in locals() else None, error=str(exc), traceback=tb)
