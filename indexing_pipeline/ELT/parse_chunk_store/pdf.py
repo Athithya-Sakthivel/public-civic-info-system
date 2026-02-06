@@ -1,14 +1,34 @@
 #!/usr/bin/env python3
 """
-Idempotent PDF parser (hardened).
+indexing_pipeline/ELT/parse_chunk_store/pdf.py
+Converged PDF parser (idempotent, single-chunk-jsonl-per-document)
 
-- One raw PDF -> one deterministic chunk JSONL at:
-    {CHUNKED_PREFIX}/{CHUNKED_SCHEMA}/{document_id}.chunks.jsonl
-- Raw manifest (<raw_key>.manifest.json) extended with `chunked` block containing chunked_sha256.
-- If manifest.chunked.chunked_sha256 matches computed SHA and FORCE_OVERWRITE is false -> skip (idempotent).
-- Deterministic JSONL (sort_keys=True) and atomic writes (S3: temp->copy->delete; local: temp->replace).
-- Minimal chunk payload — no language detection, no embedding, no full original manifest insertion.
+Assumptions & external contracts:
+- Runtime: Python 3.8+ (tested with 3.11). Optional libs: boto3 (for S3), fitz (PyMuPDF) or pymupdf, pdfplumber,
+  Pillow, pytesseract, tiktoken. The parser falls back gracefully when optional libs are absent.
+- STORAGE env expected to be 's3' or 'local' (router will set STORAGE='local' if configured 'fs').
+- When STORAGE == 's3', S3_BUCKET must be set.
+- Raw bytes are read from a 'key' (S3 object key or local path/relative filename).
+- Idempotency boundary:
+  * One JSONL chunk file is written to CHUNKED_PREFIX/<CHUNKED_SCHEMA>/<document_id>.chunks.jsonl
+  * Raw manifest at <raw_key>.manifest.json is extended with `chunked` metadata including chunked_sha256.
+  * If manifest already contains identical chunked_sha256 and FORCE_OVERWRITE is false => skip (no writes).
+- All S3 writes are atomic via temp-key -> copy -> delete pattern. Local writes are atomic via temp file -> replace.
+- parse_file(key, manifest) -> dict with at least "saved_chunks": int. If skipped, include "skipped": True.
+- Determinism: document_id derived from raw content SHA256 by default (or manifest.file_hash if provided).
+
+Invariants:
+- Re-running parse_file on unchanged raw content produces no additional writes once raw_manifest.chunked.chunked_sha256
+  equals the computed JSONL sha.
+- Chunk filename derivation and raw manifest extension are deterministic and minimal.
+
+Logging:
+- Every important decision logs a structured JSON line.
+
+Return:
+- parse_file returns {"saved_chunks": int, ...}
 """
+
 from __future__ import annotations
 import os
 import sys
@@ -23,8 +43,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 
-# --- ENV / CONFIG ---
-STORAGE = os.getenv("STORAGE", "s3").strip().lower()         # 's3' or 'local'
+# -------------------------
+# Environment / config (explicit at top)
+# -------------------------
+STORAGE = os.getenv("STORAGE", "s3").strip().lower()            # 's3' or 'local'
 S3_BUCKET = os.getenv("S3_BUCKET", "").strip()
 RAW_PREFIX = (os.getenv("RAW_PREFIX") or os.getenv("STORAGE_RAW_PREFIX") or "data/raw/").rstrip("/") + "/"
 CHUNKED_PREFIX = (os.getenv("CHUNKED_PREFIX") or os.getenv("STORAGE_CHUNKED_PREFIX") or "data/chunked/").rstrip("/") + "/"
@@ -37,32 +59,37 @@ PDF_OCR_RENDER_DPI = int(os.getenv("PDF_OCR_RENDER_DPI", "300"))
 PDF_MIN_IMG_SIZE_BYTES = int(os.getenv("PDF_MIN_IMG_SIZE_BYTES", "3072"))
 MAX_TOKENS_PER_CHUNK = int(os.getenv("MAX_TOKENS_PER_CHUNK", "512"))
 MIN_TOKENS_PER_CHUNK = int(os.getenv("MIN_TOKENS_PER_CHUNK", "100"))
-OVERLAP_SENTENCES = int(os.getenv("NUMBER_OF_OVERLAPPING_SENTENCES", "2"))
+OVERLAP_SENTENCES = int(os.getenv("OVERLAP_SENTENCES", "2"))
 TMPDIR = os.getenv("TMPDIR", None)
 PUT_RETRIES = int(os.getenv("PUT_RETRIES", "3"))
 PUT_BACKOFF = float(os.getenv("PUT_BACKOFF", "0.3"))
 ENC_NAME = os.getenv("ENC_NAME", "cl100k_base")
 
-# --- Fail-fast validations ---
+# validations (fail-fast)
 if STORAGE not in ("s3", "local"):
     raise SystemExit(f"Invalid STORAGE: {STORAGE!r}. Use 's3' or 'local'.")
-if STORAGE == "s3" and not S3_BUCKET:
-    raise SystemExit("S3_BUCKET must be set when STORAGE='s3'.")
 
-# --- Logging helpers ---
-def now_iso() -> str:
+if STORAGE == "s3" and not S3_BUCKET:
+    raise SystemExit("S3_BUCKET env required when STORAGE='s3'")
+
+# -------------------------
+# Logging helpers
+# -------------------------
+def now_ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
-def log(level: str, event: str, **extra) -> None:
-    rec = {"ts": now_iso(), "level": level, "event": event}
-    rec.update(extra)
-    line = json.dumps(rec, ensure_ascii=False, sort_keys=True)
-    if level.lower() in ("error", "critical", "err"):
+def log(level: str, event: str, **extra):
+    obj = {"ts": now_ts(), "level": level, "event": event}
+    obj.update(extra)
+    line = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    if level.lower() in ("error", "err", "critical"):
         print(line, file=sys.stderr, flush=True)
     else:
         print(line, flush=True)
 
-# --- optional libs (lazy imports) ---
+# -------------------------
+# Optional libs (lazy failures handled)
+# -------------------------
 try:
     from PIL import Image
 except Exception:
@@ -91,7 +118,7 @@ def import_fitz():
             _fitz = _m
             return _fitz
         except Exception as e:
-            raise RuntimeError("Failed to import PyMuPDF/fitz: " + str(e))
+            raise RuntimeError("PyMuPDF (fitz/pymupdf) not available: " + str(e))
 
 def import_pdfplumber():
     global _pdfplumber
@@ -102,35 +129,42 @@ def import_pdfplumber():
         _pdfplumber = _p
         return _pdfplumber
     except Exception as e:
-        raise RuntimeError("Failed to import pdfplumber: " + str(e))
+        raise RuntimeError("pdfplumber not available: " + str(e))
 
 try:
     import tiktoken
 except Exception:
     tiktoken = None
 
-# --- S3 helpers (atomic writes) ---
+# -------------------------
+# S3 helpers (atomic writes)
+# -------------------------
 def _ensure_s3_client():
     try:
         import boto3
     except Exception as e:
-        raise RuntimeError("boto3 required for S3: " + str(e))
+        raise RuntimeError("boto3 is required for S3 STORAGE backend: " + str(e))
     return boto3.client("s3")
 
 def _s3_atomic_put(final_key: str, data: bytes, content_type: Optional[str] = "application/octet-stream"):
+    """
+    Atomic write to S3: put temp key, copy to final key, delete temp key.
+    final_key is the object key (no bucket prefix).
+    """
     client = _ensure_s3_client()
-    tmp_key = f"{final_key}.tmp.{os.getpid()}.{int(time.time()*1000)}"
+    temp_key = f"{final_key}.tmp.{os.getpid()}.{int(time.time()*1000)}"
     last_exc = None
     for attempt in range(1, PUT_RETRIES + 1):
         try:
-            client.put_object(Bucket=S3_BUCKET, Key=tmp_key, Body=data, ContentType=content_type)
-            client.copy_object(Bucket=S3_BUCKET, CopySource={"Bucket": S3_BUCKET, "Key": tmp_key}, Key=final_key)
-            client.delete_object(Bucket=S3_BUCKET, Key=tmp_key)
+            client.put_object(Bucket=S3_BUCKET, Key=temp_key, Body=data, ContentType=content_type)
+            client.copy_object(Bucket=S3_BUCKET, CopySource={'Bucket': S3_BUCKET, 'Key': temp_key}, Key=final_key)
+            client.delete_object(Bucket=S3_BUCKET, Key=temp_key)
             return
         except Exception as e:
             last_exc = e
+            # best-effort cleanup
             try:
-                client.delete_object(Bucket=S3_BUCKET, Key=tmp_key)
+                client.delete_object(Bucket=S3_BUCKET, Key=temp_key)
             except Exception:
                 pass
             if attempt < PUT_RETRIES:
@@ -138,61 +172,61 @@ def _s3_atomic_put(final_key: str, data: bytes, content_type: Optional[str] = "a
                 continue
             raise last_exc
 
-# --- atomic write wrappers ---
+# -------------------------
+# Atomic writes (S3 and local)
+# -------------------------
 def write_text_atomic_to_chunked(rel_path: str, text: str) -> None:
     rel_path = rel_path.lstrip("/")
-    final = f"{CHUNKED_PREFIX.rstrip('/')}/{rel_path}"
+    final_key = f"{CHUNKED_PREFIX.rstrip('/')}/{rel_path}"
     if STORAGE == "s3":
-        _s3_atomic_put(final, text.encode("utf-8"), content_type="application/json")
+        _s3_atomic_put(final_key, text.encode("utf-8"), content_type="application/json")
     else:
-        p = Path(final)
+        p = Path(final_key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmpf = tempfile.NamedTemporaryFile(delete=False, dir=str(p.parent), suffix=".tmp")
-        tmp_name = tmpf.name
+        tmp = tempfile.NamedTemporaryFile(delete=False, dir=str(p.parent), suffix=".tmp")
         try:
-            tmpf.write(text.encode("utf-8"))
-            tmpf.flush()
-            os.fsync(tmpf.fileno())
-            tmpf.close()
-            Path(tmp_name).replace(p)
+            tmp.write(text.encode("utf-8"))
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp.close()
+            Path(tmp.name).replace(p)
         finally:
-            if os.path.exists(tmp_name):
+            if os.path.exists(tmp.name):
                 try:
-                    os.unlink(tmp_name)
+                    os.unlink(tmp.name)
                 except Exception:
                     pass
 
 def write_bytes_atomic_to_chunked(rel_path: str, data: bytes, content_type: str = "application/octet-stream") -> None:
     rel_path = rel_path.lstrip("/")
-    final = f"{CHUNKED_PREFIX.rstrip('/')}/{rel_path}"
+    final_key = f"{CHUNKED_PREFIX.rstrip('/')}/{rel_path}"
     if STORAGE == "s3":
-        _s3_atomic_put(final, data, content_type=content_type)
+        _s3_atomic_put(final_key, data, content_type=content_type)
     else:
-        p = Path(final)
+        p = Path(final_key)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmpf = tempfile.NamedTemporaryFile(delete=False, dir=str(p.parent), suffix=".tmp")
-        tmp_name = tmpf.name
+        tmp = tempfile.NamedTemporaryFile(delete=False, dir=str(p.parent), suffix=".tmp")
         try:
-            tmpf.write(data)
-            tmpf.flush()
-            os.fsync(tmpf.fileno())
-            tmpf.close()
-            Path(tmp_name).replace(p)
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp.close()
+            Path(tmp.name).replace(p)
         finally:
-            if os.path.exists(tmp_name):
+            if os.path.exists(tmp.name):
                 try:
-                    os.unlink(tmp_name)
+                    os.unlink(tmp.name)
                 except Exception:
                     pass
 
-# --- util functions ---
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
+def compute_sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
 
-def now_ts() -> str:
-    return now_iso()
-
-# --- token encoding helper ---
+# -------------------------
+# Tokenization & splitting (deterministic)
+# -------------------------
 class TokenEncoder:
     def __init__(self, enc_name: str = ENC_NAME):
         if tiktoken is not None:
@@ -208,7 +242,6 @@ class TokenEncoder:
         self.decode = lambda toks: " ".join(str(x) for x in toks)
         self.backend = "whitespace"
 
-# --- text splitting utilities ---
 _sentence_re = re.compile(r'(.+?[\.\?\!\n]+)|(.+?$)', re.DOTALL)
 
 def sentence_spans(text: str) -> List[Tuple[str,int,int]]:
@@ -241,11 +274,11 @@ def split_into_windows(text: str, max_tokens: int = MAX_TOKENS_PER_CHUNK,
     token_cursor = 0
     for s, sc, ec in spans:
         toks = encoder.encode(s)
-        tok_len = len(toks) if isinstance(toks, (list, tuple)) else 1
+        tok_len = len(toks) if isinstance(toks, (list,tuple)) else 1
         sent_items.append({"text": s, "start_char": sc, "end_char": ec, "token_len": tok_len, "tokens": toks})
     if not sent_items:
         toks = encoder.encode(text)
-        yield {"window_index": 0, "text": text, "token_count": len(toks) if isinstance(toks, (list,tuple)) else 1, "token_start": 0, "token_end": len(toks) if isinstance(toks,(list,tuple)) else 1}
+        yield {"window_index": 0, "text": text, "token_count": len(toks) if isinstance(toks,(list,tuple)) else 1, "token_start": 0, "token_end": len(toks) if isinstance(toks,(list,tuple)) else 1}
         return
     for si in sent_items:
         si["token_start_idx"] = token_cursor
@@ -273,10 +306,7 @@ def split_into_windows(text: str, max_tokens: int = MAX_TOKENS_PER_CHUNK,
             toks = sent["tokens"]
             if isinstance(toks, (list,tuple)):
                 truncated = toks[:max_tokens]
-                try:
-                    chunk_text = encoder.decode(truncated)
-                except Exception:
-                    chunk_text = " ".join(str(x) for x in truncated)
+                chunk_text = encoder.decode(truncated)
                 cur_token_count = len(truncated)
                 remaining = toks[max_tokens:]
                 if remaining:
@@ -288,7 +318,7 @@ def split_into_windows(text: str, max_tokens: int = MAX_TOKENS_PER_CHUNK,
                     i += 1
             else:
                 chunk_text = sent["text"]
-                cur_token_count = sent.get("token_len", 1)
+                cur_token_count = sent.get("token_len",1)
                 i += 1
             chunk_token_end = chunk_token_start + cur_token_count
         else:
@@ -337,11 +367,9 @@ def derive_semantic_region(cumulative_before: int, chunk_tok: int, total_tokens:
     except Exception:
         return "unknown"
 
-# --- PDF page extraction helpers (fitz + pdfplumber) ---
-def _ensure_pdf_libs():
-    import_fitz()
-    import_pdfplumber()
-
+# -------------------------
+# PDF extraction helpers (fitz + pdfplumber + OCR)
+# -------------------------
 def download_to_tempfile(bytes_data: bytes, suffix: str = ".pdf") -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMPDIR)
     try:
@@ -372,6 +400,10 @@ def reflow_and_clean_text(text: str) -> str:
     return text
 
 def extract_page_clean_and_figures(pdf_path: str, pageno: int) -> Tuple[str, List[str]]:
+    """
+    Extract main flowing text (attempt column reflow) and extract figure/table OCR text when appropriate.
+    Returns (clean_text, list_of_figures_texts)
+    """
     fitz = import_fitz()
     pdfplumb = import_pdfplumber()
     doc = fitz.open(pdf_path)
@@ -422,12 +454,14 @@ def extract_page_clean_and_figures(pdf_path: str, pageno: int) -> Tuple[str, Lis
             a_area = max(1.0, (xa1-xa0)*(ya1-ya0))
             if inter_area / a_area > 0.25:
                 overlapped = True
+                # caption if appears below the figure and close
                 if ya0 >= yb1 and (ya0 - yb1) < 80:
                     caption_map.setdefault(fb, []).append(tb["text"])
                 break
         if not overlapped:
             content_blocks.append(tb)
 
+    # reflow heuristics: left-to-right then top-to-bottom grouping
     if not content_blocks:
         clean_text = ""
     else:
@@ -464,6 +498,7 @@ def extract_page_clean_and_figures(pdf_path: str, pageno: int) -> Tuple[str, Lis
     clean_text = reflow_and_clean_text(clean_text)
 
     figures_texts: List[str] = []
+    # extract tables text
     for t in tables:
         try:
             rows = t.extract() if hasattr(t, "extract") else t.extract_table() if hasattr(t, "extract_table") else None
@@ -474,6 +509,7 @@ def extract_page_clean_and_figures(pdf_path: str, pageno: int) -> Tuple[str, Lis
                 figures_texts.append("\n".join(lines))
         except Exception:
             continue
+    # OCR image regions if needed
     for fb in image_bboxes:
         try:
             png_bytes = crop_page_to_png_bytes(page, fb, dpi=PDF_OCR_RENDER_DPI)
@@ -493,10 +529,13 @@ def extract_page_clean_and_figures(pdf_path: str, pageno: int) -> Tuple[str, Lis
                 figures_texts.append(combined)
         except Exception:
             continue
+
     plumb.close(); doc.close()
     return clean_text, figures_texts
 
-# --- chunk existence & manifest helpers ---
+# -------------------------
+# Chunk path & manifest helpers
+# -------------------------
 def _chunk_rel_for_doc(document_id: str) -> str:
     return f"{CHUNKED_SCHEMA.rstrip('/')}/{document_id}.chunks.jsonl"
 
@@ -515,6 +554,7 @@ def _chunk_exists(document_id: str) -> bool:
         return p.exists()
 
 def _raw_manifest_key_for_raw_key(raw_key: str) -> str:
+    # raw_key is either S3 key or local path returned by router; manifest stored alongside raw by appending .manifest.json
     if STORAGE == "s3":
         return raw_key + ".manifest.json"
     p = Path(raw_key)
@@ -527,7 +567,8 @@ def _read_raw_manifest(raw_manifest_key: str) -> Dict[str, Any]:
         s3 = _ensure_s3_client()
         try:
             resp = s3.get_object(Bucket=S3_BUCKET, Key=raw_manifest_key)
-            return json.loads(resp["Body"].read().decode("utf-8"))
+            body = resp["Body"].read()
+            return json.loads(body.decode("utf-8"))
         except Exception:
             return {}
     else:
@@ -540,23 +581,28 @@ def _read_raw_manifest(raw_manifest_key: str) -> Dict[str, Any]:
 def _write_raw_manifest(raw_manifest_key: str, manifest_obj: Dict[str, Any]) -> None:
     if STORAGE == "s3":
         s3 = _ensure_s3_client()
-        body = json.dumps(manifest_obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        body = json.dumps(manifest_obj, ensure_ascii=False).encode("utf-8")
         _s3_atomic_put(raw_manifest_key, body, content_type="application/json")
     else:
         p = Path(raw_manifest_key)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(p.suffix + ".tmp")
         with tmp.open("wb") as fh:
-            fh.write(json.dumps(manifest_obj, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
+            fh.write(json.dumps(manifest_obj, ensure_ascii=False, indent=2).encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
         tmp.replace(p)
 
 def _write_chunks_and_extend_raw_manifest(document_id: str, chunks: List[Dict[str, Any]], raw_key: str, raw_sha: str, original_url: Optional[str] = None) -> Tuple[str, int, str]:
+    """
+    Idempotent: compute JSONL locally, compute sha; if raw_manifest.chunked.chunked_sha256 == sha && not FORCE_OVERWRITE then skip writes.
+    Otherwise atomically write chunk JSONL to CHUNKED_PREFIX and update raw manifest with minimal changes.
+    Returns (chunk_file, size_bytes, sha)
+    """
     rel = _chunk_rel_for_doc(document_id)
     jsonl_text = "\n".join(json.dumps(c, ensure_ascii=False, sort_keys=True) for c in chunks) + "\n"
     jsonl_bytes = jsonl_text.encode("utf-8")
-    sha = sha256_bytes(jsonl_bytes)
+    sha = compute_sha256_bytes(jsonl_bytes)
     size = len(jsonl_bytes)
 
     raw_manifest_key = _raw_manifest_key_for_raw_key(raw_key)
@@ -570,7 +616,7 @@ def _write_chunks_and_extend_raw_manifest(document_id: str, chunks: List[Dict[st
             chunk_file = str(Path(CHUNKED_PREFIX) / rel)
         return chunk_file, size, sha
 
-    # write chunk file
+    # write chunk file atomically
     try:
         write_text_atomic_to_chunked(rel, jsonl_text)
     except Exception as e:
@@ -602,6 +648,7 @@ def _write_chunks_and_extend_raw_manifest(document_id: str, chunks: List[Dict[st
     existing["saved_chunks"] = len(chunks)
     existing["chunked_manifest_written_at"] = now_ts()
 
+    # atomic manifest write
     try:
         _write_raw_manifest(raw_manifest_key, existing)
     except Exception as e:
@@ -611,20 +658,28 @@ def _write_chunks_and_extend_raw_manifest(document_id: str, chunks: List[Dict[st
     log("info", "raw_manifest_extended", raw_manifest=raw_manifest_key, chunk_file=chunk_file, chunks=len(chunks), sha256=sha, size=size)
     return chunk_file, size, sha
 
-# --- public parse_file (idempotent) ---
+# -------------------------
+# parse_file: main entrypoint (idempotent)
+# -------------------------
 def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Parse raw PDF bytes referenced by `key` and extend raw manifest with chunk metadata.
+    Returns: {"saved_chunks": int, "skipped": bool, ...}
+    """
     start = time.perf_counter()
     tmp_pdf_path: Optional[str] = None
     try:
+        # basic pre-checks
         if STORAGE == "s3" and not S3_BUCKET:
             return {"saved_chunks": 0, "error": "S3_BUCKET not configured"}
         if Image is None:
             return {"saved_chunks": 0, "error": "Pillow library not available (required)"}
         try:
-            _ensure_pdf_libs()
+            import_fitz(); import_pdfplumber()
         except Exception as e:
             return {"saved_chunks": 0, "error": f"pdf libs missing: {str(e)}"}
 
+        # read raw bytes
         try:
             raw_bytes = _read_raw_bytes(key)
         except Exception as e:
@@ -632,16 +687,19 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
             log("error", "read_failed", key=key, error=str(e), traceback=tb)
             return {"saved_chunks": 0, "error": f"read_failed: {str(e)}"}
 
-        raw_sha = sha256_bytes(raw_bytes)
+        raw_sha = compute_sha256_bytes(raw_bytes)
         document_id = manifest.get("file_hash") or raw_sha
 
+        # quick idempotency check: chunk file exists
         if not FORCE_OVERWRITE and _chunk_exists(document_id):
             duration_ms = int((time.perf_counter() - start) * 1000)
             log("info", "skip_existing_chunks", document_id=document_id, key=key, duration_ms=duration_ms)
             return {"saved_chunks": 0, "skipped": True}
 
+        # write raw bytes to tempfile for pdf libs
         tmp_pdf_path = download_to_tempfile(raw_bytes, suffix=".pdf")
 
+        # open pdf
         try:
             fitz = import_fitz()
             doc = fitz.open(tmp_pdf_path)
@@ -658,6 +716,8 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         encoder = TokenEncoder()
         total_pages = len(doc)
         page_infos: List[Dict[str, Any]] = []
+
+        # extract content per page
         for pageno in range(total_pages):
             try:
                 clean_text, figures = extract_page_clean_and_figures(tmp_pdf_path, pageno)
@@ -701,10 +761,13 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
                     "ingest_time": now_ts(),
                     "parser_version": PARSER_VERSION,
                     "used_ocr": used_ocr,
-                    "provenance": provenance_base
+                    "original_manifest": manifest,
+                    "provenance": provenance_base,
+                    "embedding": None
                 }
-                chunks.append({k: v for k, v in payload.items() if v is not None})
+                chunks.append(payload)
                 continue
+
             windows = list(split_into_windows(clean_text, max_tokens=MAX_TOKENS_PER_CHUNK, min_tokens=MIN_TOKENS_PER_CHUNK, overlap_sentences=OVERLAP_SENTENCES, encoder=encoder))
             for idx, w in enumerate(windows):
                 token_count = int(w.get("token_count", 0))
@@ -727,11 +790,14 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
                     "ingest_time": now_ts(),
                     "parser_version": PARSER_VERSION,
                     "used_ocr": used_ocr,
-                    "provenance": provenance_base
+                    "original_manifest": manifest,
+                    "provenance": provenance_base,
+                    "embedding": None
                 }
-                chunks.append({k: v for k, v in payload.items() if v is not None})
+                chunks.append(payload)
                 cumulative_tokens += token_count
 
+        # cleanup pdf doc + tmp
         try:
             doc.close()
         except Exception:
@@ -747,11 +813,13 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
             log("info", "no_chunks", key=key, duration_ms=duration_ms)
             return {"saved_chunks": 0}
 
+        # race check after parse
         if not FORCE_OVERWRITE and _chunk_exists(document_id):
             duration_ms = int((time.perf_counter() - start) * 1000)
             log("info", "race_skip_existing_after_parse", document_id=document_id, key=key, duration_ms=duration_ms)
             return {"saved_chunks": 0, "skipped": True}
 
+        # write chunk file and extend raw manifest atomically
         try:
             chunk_file, size, sha = _write_chunks_and_extend_raw_manifest(document_id, chunks, key, raw_sha, manifest.get("original_url"))
         except Exception as e:
@@ -761,6 +829,7 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
 
         duration_ms = int((time.perf_counter() - start) * 1000)
         log("info", "parse_complete", key=key, document_id=document_id, saved_chunks=len(chunks), chunk_file=chunk_file, chunk_size_bytes=size, chunked_sha256=sha, duration_ms=duration_ms)
+        # final sanity: returned saved_chunks must equal len(chunks)
         return {"saved_chunks": len(chunks)}
     except Exception as exc:
         tb = traceback.format_exc()
@@ -773,8 +842,14 @@ def parse_file(key: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-# --- internal read helper ---
+# -------------------------
+# internal read helper (bottom)
+# -------------------------
 def _read_raw_bytes(key: str) -> bytes:
+    """
+    Read raw bytes for key. If STORAGE='s3' key is the object key; otherwise key may be a filesystem path
+    or a filename relative to RAW_PREFIX.
+    """
     if STORAGE == "s3":
         s3 = _ensure_s3_client()
         resp = s3.get_object(Bucket=S3_BUCKET, Key=key)
@@ -788,5 +863,8 @@ def _read_raw_bytes(key: str) -> bytes:
         with p.open("rb") as fh:
             return fh.read()
 
+# -------------------------
+# module loaded notice
+# -------------------------
 if __name__ == "__main__":
     log("info", "module_loaded", module=__file__, parser_version=PARSER_VERSION)
