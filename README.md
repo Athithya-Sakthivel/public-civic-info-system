@@ -158,6 +158,7 @@ export SKIP_WEB_SCRAPING=false
 make create-s3
 make upload-force
 
+pip install -r 
 bash infra/scripts/local_setup.sh
 
 ```
