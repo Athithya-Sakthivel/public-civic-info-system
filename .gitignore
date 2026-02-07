@@ -9,3 +9,4 @@ context.md
 venv
 outputs.json
 output.json
+__pycache__/
