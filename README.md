@@ -161,7 +161,7 @@ make upload-force
 bash infra/scripts/local_setup.sh
 
 ```
-
+![alt text](image.png)
 
 
 
