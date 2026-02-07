@@ -69,8 +69,5 @@ export EMBED_DIM=1024
 export MIN_SIMILARITY=0.25
 export GEN_BUDGET_SEC=6.0
 
-pip install -r inference_pipeline/requirements.local.txt
 
-bash infra/scripts/local_setup.sh
-
-# new terminal: cd inference_pipeline/frontend && python3 -m http.server 8080
+uvicorn inference_pipeline.channels.http:app --host 0.0.0.0 --port 8000

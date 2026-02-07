@@ -158,8 +158,10 @@ export SKIP_WEB_SCRAPING=false
 make create-s3
 make upload-force
 
-pip install -r 
+
 bash infra/scripts/local_setup.sh
+
+# new terminal: cd inference_pipeline/frontend && python3 -m http.server 8080
 
 ```
 ![alt text](image.png)
