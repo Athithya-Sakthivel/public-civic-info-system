@@ -71,8 +71,8 @@ PG_DB = _env("PG_DB", "postgres")
 PG_TABLE_NAME = _env("PG_INDEX_NAME", "civic_chunks")
 RAW_K = int(_env("RAW_K", "50"))
 FINAL_K = int(_env("FINAL_K", "5"))
-MIN_SIMILARITY = float(_env("MIN_SIMILARITY", "0.35"))
-ASR_CONF_THRESHOLD = float(_env("ASR_CONF_THRESHOLD", "0.35"))
+MIN_SIMILARITY = float(_env("MIN_SIMILARITY", "0.25"))
+ASR_CONF_THRESHOLD = float(_env("ASR_CONF_THRESHOLD", "0.25"))
 EMBED_SEARCH_BUDGET_SEC = float(_env("EMBED_SEARCH_BUDGET_SEC", "2.5"))
 GEN_BUDGET_SEC = float(_env("GEN_BUDGET_SEC", "4.0"))
 BEDROCK_MODEL_ID = _env("BEDROCK_MODEL_ID") or "qwen.qwen3-next-80b-a3b"
@@ -80,6 +80,7 @@ BEDROCK_MAX_RETRIES = int(_env("BEDROCK_MAX_RETRIES", "1"))
 BEDROCK_RETRY_BASE_DELAY_SEC = float(_env("BEDROCK_RETRY_BASE_DELAY_SEC", "0.25"))
 AUDIT_S3_BUCKET = _env("AUDIT_S3_BUCKET")
 AUDIT_S3_PREFIX = _env("AUDIT_S3_PREFIX", "audits/")
+VALIDATION_STRICT = (_env("VALIDATION_STRICT", "0").strip() != "0")
 
 ALLOWED_LANGUAGES = set(["en", "hi", "ta", "bn", "te", "ml", "kn", "mr", "gu"])
 ALLOWED_CHANNELS = set(["web", "sms", "voice"])
@@ -95,6 +96,7 @@ GUIDANCE_KEYS = {
     "insufficient_evidence": "refusal_insufficient_evidence",
     "invalid_request": "refusal_invalid_request",
 }
+
 CITATION_PAT = re.compile(r"\[(\d+)\]\s*$")
 DISALLOWED_SUBSTRINGS = ("http://", "https://", "www.", "file://")
 
@@ -156,10 +158,10 @@ def get_embedding_from_bedrock(text: str) -> List[float]:
     mr = json.loads(raw)
     emb = mr.get("embedding") or mr.get("embeddings") or mr.get("vector")
     if not isinstance(emb, list):
-        jlog("bedrock returned invalid embedding")
+        jlog({"level":"ERROR","event":"bedrock_no_embedding","response_sample":str(mr)[:200]})
         raise RuntimeError("bedrock returned no embedding list")
     if len(emb) != EMBED_DIM:
-        jlog(f"bedrock embedding dim mismatch expected={EMBED_DIM} received={len(emb)}")
+        jlog({"level":"ERROR","event":"bedrock_dim_mismatch","expected":EMBED_DIM,"received":len(emb)})
         raise RuntimeError("embedding_dim_mismatch")
     return [float(x) for x in emb]
 
@@ -353,11 +355,11 @@ def retrieve(event: Dict[str, Any]) -> Dict[str, Any]:
     jlog(f"retrieval complete | request_id={request_id} | returned={len(passages)} | top_similarity={top_similarity} | ms={elapsed_ms}")
     return {"request_id": request_id, "passages": passages, "chunk_ids": chunk_ids, "top_similarity": float(top_similarity)}
 
-def call_bedrock(prompt_text: str) -> str:
+def call_bedrock(prompt_text: str, model_id: Optional[str] = None) -> str:
     client = init_bedrock_client()
-    identifier = BEDROCK_MODEL_ID
+    identifier = model_id or BEDROCK_MODEL_ID
     inference_config = {"maxTokens": int(_env("BEDROCK_MAX_TOKENS") or 256), "temperature": float(_env("BEDROCK_TEMPERATURE") or 0.2), "topP": float(_env("BEDROCK_TOP_P") or 0.95)}
-    system = [{"text": ("You are a government assistant. Use the passages. If you cannot answer from passages, say NOT_ENOUGH_INFORMATION.")}]
+    system = [{"text": ("You are a government assistant. Use the passages. If you cannot answer from passages, reply NOT_ENOUGH_INFORMATION. Each factual sentence must end with a [n] citation.")}]
     messages = [{"role": "user", "content": [{"text": prompt_text}]}]
     try:
         resp = client.converse(modelId=identifier, messages=messages, system=system, inferenceConfig=inference_config)
@@ -427,6 +429,8 @@ def _validate_generator_output_and_extract_lines_raw(raw_text: str, passages: Li
             t = s.strip()
             if not t:
                 continue
+            if t.upper() == "NOT_ENOUGH_INFORMATION":
+                return "NOT_ENOUGH_INFORMATION", []
             if re.search(r'\[n\]([\.\!\?]?$)', t, re.I):
                 cited = seq
                 t_new = re.sub(r'\[n\]([\.\!\?]?$)', f'[{cited}]\\1', t, flags=re.I)
@@ -544,18 +548,16 @@ def _hydrate_citation_metadata(passages: List[Dict[str, Any]]) -> List[Dict[str,
     citations = []
     for p in passages:
         src = p.get("source_url")
+        final_src = src
         if isinstance(src, str) and src.startswith("s3://"):
             try:
                 no_prefix = src[5:]
                 parts = no_prefix.split("/", 1)
                 bucket = parts[0]
                 path = parts[1] if len(parts) > 1 else ""
-                src_https = f"https://{bucket}.s3.amazonaws.com/{path}"
+                final_src = f"https://{bucket}.s3.amazonaws.com/{path}"
             except Exception:
-                src_https = src
-            final_src = src_https
-        else:
-            final_src = src
+                final_src = src
         citations.append(
             {
                 "citation": p.get("number"),
@@ -669,13 +671,13 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "used_chunk_ids": [], "resolution": "not_enough_info", "timing_ms": int((time.time() - start_time) * 1000)})
         return {"request_id": request_id, "resolution": "not_enough_info"}
     if top_similarity < MIN_SIMILARITY:
-        jlog(f"too_low_similarity | request_id={request_id} | top_similarity={top_similarity} | min={MIN_SIMILARITY}")
+        jlog(f"too_low_similarity | request_id={request_id} | top_similarity={top_similarity}")
         _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "used_chunk_ids": chunk_ids, "resolution": "not_enough_info", "timing_ms": int((time.time() - start_time) * 1000)})
         return {"request_id": request_id, "resolution": "not_enough_info", "top_similarity": top_similarity}
     prompt_text = "LANGUAGE: " + language + "\n\nPASSAGES:\n"
     for p in passages:
         prompt_text += f"{int(p.get('number'))}. {(p.get('text') or '').strip()}\n"
-    prompt_text += "\nQUESTION:\n" + query_text + "\n\nAnswer using only the numbered passages when possible; if passages lack direct answer, say NOT_ENOUGH_INFORMATION. End each factual sentence with [n]."
+    prompt_text += "\nQUESTION:\n" + query_text + "\n\nAnswer from these passages if relevant; otherwise reply NOT_ENOUGH_INFORMATION. Each factual sentence must end with a [n] citation."
     gen_start = time.time()
     gen_raw = None
     attempt = 0
@@ -698,22 +700,27 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "used_chunk_ids": chunk_ids, "resolution": "refusal", "reason": "generator_failed", "timing_ms": int((time.time() - start_time) * 1000)})
         return {"request_id": request_id, "resolution": "refusal", "reason": "generator_failed"}
     validation_decision, validated_lines = _validate_generator_output_and_extract_lines_raw(gen_raw, passages)
+    citations = _hydrate_citation_metadata(passages)
     if validation_decision == "NOT_ENOUGH_INFORMATION":
         jlog(f"generator_refuse_no_info | request_id={request_id}")
         _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "used_chunk_ids": chunk_ids, "resolution": "not_enough_info", "timing_ms": int((time.time() - start_time) * 1000)})
         return {"request_id": request_id, "resolution": "not_enough_info"}
-    if validation_decision == "ACCEPT":
-        citations = _hydrate_citation_metadata(passages)
-        res = {"request_id": request_id, "resolution": "answer", "answer_lines": validated_lines, "citations": citations, "confidence": "high", "generator_attempts": attempt + 1}
-        _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "query": query_text, "used_chunk_ids": chunk_ids, "top_similarity": top_similarity, "resolution": res["resolution"], "generator_decision": "ACCEPT", "generator_attempts": attempt + 1, "timing_ms": int((time.time() - start_time) * 1000)})
-        jlog(f"request complete | request_id={request_id} | resolution=answer | returned_lines={len(validated_lines)}")
-        return res
-    jlog(f"validation not accepted | request_id={request_id} | decision={validation_decision}")
-    citations = _hydrate_citation_metadata(passages)
-    fallback_lines = [{"text": gen_raw.strip()}]
-    res = {"request_id": request_id, "resolution": "answer", "answer_lines": fallback_lines, "citations": citations, "confidence": "low", "validation_decision": validation_decision, "generator_attempts": attempt + 1}
-    _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "query": query_text, "used_chunk_ids": chunk_ids, "top_similarity": top_similarity, "resolution": res["resolution"], "generator_decision": validation_decision, "generator_attempts": attempt + 1, "timing_ms": int((time.time() - start_time) * 1000)})
-    jlog(f"request complete | request_id={request_id} | resolution=answer_fallback | returned_lines={len(fallback_lines)}")
+    if validation_decision != "ACCEPT":
+        if not VALIDATION_STRICT:
+            jlog(f"relaxed_validation_used | request_id={request_id} | reason={validation_decision}")
+            res = {"request_id": request_id, "resolution": "answer", "answer_lines": [{"text": gen_raw.strip()}], "sources": [c.get("source_url") for c in citations], "confidence": "low", "citation_missing": True}
+            if isinstance(gen_raw, dict) and gen_raw.get("tts_url"):
+                res["tts_url"] = gen_raw.get("tts_url")
+            _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "query": query_text, "used_chunk_ids": chunk_ids, "top_similarity": top_similarity, "resolution": res["resolution"], "generator_decision": validation_decision, "timing_ms": int((time.time() - start_time) * 1000)})
+            jlog(f"request complete | request_id={request_id} | resolution={res['resolution']} | citation_missing=1")
+            return res
+        else:
+            jlog(f"generator_invalid_output | request_id={request_id} | validation_decision={validation_decision}")
+            _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "used_chunk_ids": chunk_ids, "resolution": "invalid_output", "timing_ms": int((time.time() - start_time) * 1000)})
+            return {"request_id": request_id, "resolution": "invalid_output"}
+    res = {"request_id": request_id, "resolution": "answer", "answer_lines": validated_lines, "citations": citations, "sources": [c.get("source_url") for c in citations], "confidence": "high"}
+    _write_audit({"session_id": session_id, "request_id": request_id, "language": language, "channel": channel, "query": query_text, "used_chunk_ids": chunk_ids, "top_similarity": top_similarity, "resolution": res["resolution"], "generator_attempts": attempt + 1, "timing_ms": int((time.time() - start_time) * 1000)})
+    jlog(f"request complete | request_id={request_id} | resolution={res['resolution']} | returned_lines={len(validated_lines)}")
     return res
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:

@@ -21,48 +21,6 @@ indexing_pipeline/
 ├── main.py                        # Container entrypoint orchestrating indexing pipeline
 └── requirements.txt               # Runtime-only Python dependencies (no build tools)
 |
-inference_pipeline/
-├── core/                                  # Core inference logic bundled into ONE Lambda (no channel knowledge)
-│   ├── query.py                           # Central query router; validation, policy, orchestration of retrieval + generation
-│   ├── retriever.py                       # Semantic retrieval using embeddings + pgvector (HNSW), returns ranked passages
-│   ├── generator.py                       # Grounded answer generation via LLM with strict citation/output validation
-│   ├── __init__.py                        # Marks core as a Python package for stable imports
-│   └── requirements.txt                  # All inference dependencies (LLM client, DB client, embeddings)
-│
-├── channels/                              # Channel-specific adapters (thin Lambdas, no business logic)
-│   ├── http/
-│   │   └── handler.py                    # API Gateway adapter; HTTP JSON → core.query.handle
-│   ├── sms/
-│   │   └── handler.py                    # SMS adapter (SNS/Pinpoint); normalize SMS → core.query.handle
-│   └── voice/
-│       └── handler.py                    # Voice adapter; audio → Transcribe → core.query.handle (+ optional Polly)
-│
-├── frontend/                              # Static, low-bandwidth web UI (served via S3 + CloudFront)
-│   ├── index.html                         # Semantic, accessible HTML shell; inputs, buttons, containers only
-│   ├── styles.css                         # Global styles; typography/layout optimized for low bandwidth
-│   ├── app.js                             # Frontend orchestrator; wires UI events to net/, ui/, state flow
-│   ├── config.js                          # Immutable runtime config; API base URL, timeouts, supported languages
-│   ├── assets/
-│   │   ├── icons/                         # Pure visual SVG icons (mic, send, info); no text or logic
-│   │   └── logo.svg                       # Branding asset; cacheable forever
-│   ├── i18n/
-│   │   ├── en.json                        # English user-facing strings and guidance text
-│   │   ├── hi.json                        # Hindi user-facing strings and guidance text
-│   │   └── ta.json                        # Tamil user-facing strings and guidance text
-│   ├── ui/
-│   │   ├── dom.js                         # DOM access layer; query/cache elements once
-│   │   ├── state.js                       # In-memory UI state (session_id, language, last response)
-│   │   └── render.js                      # Rendering logic; answer vs refusal, citations toggle
-│   ├── net/
-│   │   ├── api.js                         # Backend contract; build requests, apply timeouts, normalize responses
-│   │   └── retry.js                       # Controlled retry logic for transient failures only
-│   └── utils/
-│       ├── uuid.js                        # Stateless UUID/session ID generator
-│       ├── time.js                        # Display-only time formatting helpers
-│       └── validate.js                    # Input validation (emptiness, length limits)
-│
-└── README.md                              # System overview, deployment notes, and architecture rationale
-
 infra/
 ├── pulumi_aws/                          # Declarative infrastructure (AWS) – single source of truth
 │   ├── Pulumi.prod.yaml                 # Production stack config (values only, no logic)

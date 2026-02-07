@@ -1,7 +1,9 @@
+# inference_pipeline/channels/http.py
 from __future__ import annotations
+import os
+import sys
 import json
 import logging
-import sys
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,14 +12,13 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 _log = logging.getLogger("channels.http")
 
 def jlog(msg: str) -> None:
-    ts = __import__("datetime").datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    _log.info(f"{ts} | {msg}")
+    _log.info(msg)
 
 try:
     from inference_pipeline.core.core import handle as core_handle
 except Exception:
     try:
-        pkg_root = __import__("os").path.abspath(__import__("os").path.join(__import__("os").path.dirname(__file__), "..", ".."))
+        pkg_root = __import__("os").path.abspath(__import__("os").path.join(__import__("os").path.dirname(__file__), ".."))
         if pkg_root not in sys.path:
             sys.path.insert(0, pkg_root)
         from inference_pipeline.core.core import handle as core_handle
@@ -45,7 +46,7 @@ async def http_query(req: Request):
     language = _normalize_language(body.get("language") or req.query_params.get("language"))
     query_text = body.get("query") or body.get("question") or req.query_params.get("q") or ""
     if not query_text:
-        return Response(content=json.dumps({"error": "empty_query"}), status_code=400, media_type="application/json")
+        return Response(content=json.dumps({"error":"empty_query"}), status_code=400, media_type="application/json")
     ev = {
         "channel": "web",
         "language": language,
@@ -61,24 +62,12 @@ async def http_query(req: Request):
         core_res = core_handle(ev)
     except Exception as e:
         jlog(f"error: core.handle exception: {e}")
-        return Response(content=json.dumps({"error": "core_failure"}), status_code=500, media_type="application/json")
+        return Response(content=json.dumps({"error":"core_failure"}), status_code=500, media_type="application/json")
     if isinstance(core_res, dict) and core_res.get("resolution") == "answer":
-        answer_lines = core_res.get("answer_lines", [])
-        citations = core_res.get("citations", [])
-        minimal_sources = []
-        for c in citations:
-            src = c.get("source_url")
-            if isinstance(src, str):
-                minimal_sources.append({"citation": c.get("citation"), "source_url": src})
-        out = {
-            "request_id": core_res.get("request_id"),
-            "resolution": "answer",
-            "confidence": core_res.get("confidence", core_res.get("confidence", "low")),
-            "answer_lines": answer_lines,
-            "sources": minimal_sources
-        }
-        return Response(content=json.dumps(out, ensure_ascii=False), status_code=200, media_type="application/json")
-    return Response(content=json.dumps(core_res, ensure_ascii=False), status_code=200, media_type="application/json")
+        out = {"request_id": core_res.get("request_id"), "resolution": "answer", "answer_lines": [l if isinstance(l, dict) else {"text": l} for l in core_res.get("answer_lines", [])], "citations": [{"source_url": c.get("source_url")} for c in core_res.get("citations", [])]}
+    else:
+        out = core_res
+    return Response(content=json.dumps(out, ensure_ascii=False), status_code=200, media_type="application/json")
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
@@ -91,7 +80,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         language = _normalize_language(body.get("language") or (event.get("queryStringParameters") or {}).get("language"))
         query_text = body.get("query") or body.get("question") or (event.get("queryStringParameters") or {}).get("q") or ""
         if not query_text:
-            return {"statusCode": 400, "body": json.dumps({"error": "empty_query"})}
+            return {"statusCode": 400, "body": json.dumps({"error":"empty_query"})}
         core_ev = {
             "channel": "web",
             "language": language,
@@ -105,22 +94,10 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         jlog(f"lambda http request | lang={language} | qlen={len(core_ev['query'])}")
         core_res = core_handle(core_ev)
         if isinstance(core_res, dict) and core_res.get("resolution") == "answer":
-            answer_lines = core_res.get("answer_lines", [])
-            citations = core_res.get("citations", [])
-            minimal_sources = []
-            for c in citations:
-                src = c.get("source_url")
-                if isinstance(src, str):
-                    minimal_sources.append({"citation": c.get("citation"), "source_url": src})
-            out = {
-                "request_id": core_res.get("request_id"),
-                "resolution": "answer",
-                "confidence": core_res.get("confidence", core_res.get("confidence", "low")),
-                "answer_lines": answer_lines,
-                "sources": minimal_sources
-            }
-            return {"statusCode": 200, "body": json.dumps(out, ensure_ascii=False)}
-        return {"statusCode": 200, "body": json.dumps(core_res, ensure_ascii=False)}
+            out = {"request_id": core_res.get("request_id"), "resolution": "answer", "answer_lines": [l if isinstance(l, dict) else {"text": l} for l in core_res.get("answer_lines", [])], "citations": [{"source_url": c.get("source_url")} for c in core_res.get("citations", [])]}
+        else:
+            out = core_res
+        return {"statusCode": 200, "body": json.dumps(out, ensure_ascii=False)}
     except Exception as e:
         jlog(f"lambda handler unexpected: {e}")
-        return {"statusCode": 500, "body": json.dumps({'error': 'handler_exception'})}
+        return {"statusCode": 500, "body": json.dumps({'error':'handler_exception'})}

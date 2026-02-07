@@ -69,23 +69,5 @@ export EMBED_DIM=1024
 export MIN_SIMILARITY=0.25
 export GEN_BUDGET_SEC=6.0
 
-python3 -m inference_pipeline.core.query
-
-
-curl -X POST http://localhost:8000/v1/query   -H "Content-Type: application/json"   -d '{
-    "language": "ta",
-    "query": "இந்தியாவில் 50 வயதுடைய விவசாயிகளுக்கு கிடைக்கக்கூடிய திட்டங்கள் என்ன?"
-  }'
-
-{
-  "language": "ta",
-  "query": "PM-KISAN என்றால் என்ன?"
-}
-
-curl -X POST http://localhost:8000/v1/query   -H "Content-Type: application/json"   -d '{
-    "language": "ta",
-    "query": "PM-KISAN என்றால் என்ன?. answer in tamil"
-  }'
-
 # uvicorn inference_pipeline.channels.http:app --host 0.0.0.0 --port 8000
 # cd inference_pipeline/frontend && python3 -m http.server 8080
