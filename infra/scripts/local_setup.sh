@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-IMAGE="athithya5354/civic-indexing:amd64-arm64-v9"
+IMAGE="athithya5354/civic-indexing:amd64-arm64-v11"
 NETWORK="civic-net"
 PG_CONTAINER="pgvector"
 PG_VOLUME="pgvector-data"
