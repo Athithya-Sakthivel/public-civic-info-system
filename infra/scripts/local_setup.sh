@@ -61,4 +61,4 @@ export PG_USER=postgres
 export PG_PASSWORD=postgres
 export AWS_REGION=ap-south-1
 
-python3 inference_pipeline/core/retriever.py
+python3 -m inference_pipeline.core.query

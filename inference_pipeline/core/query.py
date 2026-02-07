@@ -1,59 +1,3 @@
-#!/usr/bin/env python3
-"""
-inference_pipeline/core/query.py
-
-Core orchestration for inference pipeline (validation, policy, retrieval, generation, audit).
-
-Assumptions & invariants (fail-fast at import):
-* Python 3.11 runtime.
-* core/retriever.py exposes retrieve(event: dict) -> dict with keys:
-    { request_id, passages: [{number, chunk_id, text, meta, source_url, ...}], chunk_ids, top_similarity }
-* core/generator.py exposes generate(event: dict) -> dict with decisions:
-    - ACCEPT -> {'request_id', 'decision':'ACCEPT', 'answer_lines':[{'text':...}], 'confidence':...}
-    - NOT_ENOUGH_INFORMATION -> {'request_id', 'decision':'NOT_ENOUGH_INFORMATION'}
-    - INVALID_OUTPUT -> {'request_id', 'decision':'INVALID_OUTPUT'}
-* Bedrock embedding/generation budgets: embed+search <= EMBED_SEARCH_BUDGET, generation <= GEN_BUDGET (logged/enforced heuristically).
-* Vector store contract (pgvector) and indexing assumed satisfied by indexing pipeline.
-* Audit sink: optional S3 bucket (AUDIT_S3_BUCKET). If present, each request writes a JSON audit record under prefix `audits/{date}/{request_id}.json`.
-* All env vars are read and validated at import to avoid drift.
-
-External contracts (request/response):
-* Canonical request (from adapters) into core.query.handler:
-  {
-    "session_id": "uuid",          # optional but recommended
-    "request_id": "uuid",          # optional
-    "language": "en|hi|ta",        # REQUIRED
-    "channel": "web|sms|voice",    # REQUIRED
-    "query": "text",               # REQUIRED
-    "region": "tn",                # optional
-    "top_k": int,                  # optional
-    "raw_k": int,                  # optional
-    "asr_confidence": float,       # required for channel=voice
-  }
-* Core response:
-  {
-    "request_id": "...",
-    "resolution": "answer" | "refusal" | "not_enough_info" | "invalid_output",
-    "answer_lines": [{ "text": "..." }],         # when resolution == "answer"
-    "citations": [{"citation": 1, "chunk_id":"c_123","source_url":"...","meta":{...}}], # when answer
-    "confidence": "high" | "low",
-    "guidance_key": "..."                         # when refusal
-  }
-
-Operational knobs (envs and defaults):
-* MIN_SIMILARITY=0.60
-* ASR_CONF_THRESHOLD=0.75
-* EMBED_SEARCH_BUDGET_SEC=2.5
-* GEN_BUDGET_SEC=4.0
-* AUDIT_S3_BUCKET (optional) -- write audit records when present
-
-Design goals:
-* Centralize policy decisions (intent blocklist, ASR gating) in this module.
-* Deterministic control flow with explicit logs for every decision.
-* Fail-closed for safety-sensitive steps.
-* Keep channel adapters thin (they should only normalize/forward).
-"""
-
 from __future__ import annotations
 import os
 import sys
@@ -62,81 +6,77 @@ import time
 import logging
 import datetime
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# Structured JSON logger
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 _log = logging.getLogger("core.query")
 
-
 def jlog(obj: Dict[str, Any]) -> None:
-    base = {
-        "ts": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "svc": "core.query",
-    }
+    base = {"ts": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z", "svc": "core.query"}
     base.update(obj)
     try:
         _log.info(json.dumps(base, sort_keys=True, default=str))
     except Exception:
         _log.info(str(base))
 
-
-# ---- Fail-fast imports ----
 try:
     import boto3
 except Exception as e:
     jlog({"level": "CRITICAL", "event": "boto3_missing", "detail": str(e)})
     raise SystemExit(2)
 
+retriever = None
+generator = None
 try:
-    # core modules (local package)
-    from core import retriever, generator  # type: ignore
-except Exception as e:
-    jlog({"level": "CRITICAL", "event": "core_import_failed", "detail": str(e)})
-    raise SystemExit(3)
+    from core import retriever as retriever, generator as generator  # type: ignore
+except Exception:
+    try:
+        pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if pkg_root not in sys.path:
+            sys.path.insert(0, pkg_root)
+        from core import retriever as retriever, generator as generator  # type: ignore
+    except Exception as e:
+        jlog({"level": "CRITICAL", "event": "core_import_failed", "detail": str(e)})
+        raise SystemExit(3)
 
-
-# ---- Env knobs (centralized & validated) ----
-def _env(key: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(key)
+def _env(k: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(k)
     return v if v is not None else default
 
-
-AWS_REGION = _env("AWS_REGION")
+AWS_REGION = _env("AWS_REGION") or _env("AWS_DEFAULT_REGION")
 if not AWS_REGION:
-    jlog({"level": "CRITICAL", "event": "env_missing", "hint": "AWS_REGION must be set"})
+    jlog({"level": "CRITICAL", "event": "aws_region_missing", "hint": "Set AWS_REGION"})
     raise SystemExit(10)
 
-MIN_SIMILARITY = float(_env("MIN_SIMILARITY", "0.60"))
-ASR_CONF_THRESHOLD = float(_env("ASR_CONF_THRESHOLD", "0.75"))
-
+MIN_SIMILARITY = float(_env("MIN_SIMILARITY", "0.35"))
+ASR_CONF_THRESHOLD = float(_env("ASR_CONF_THRESHOLD", "0.35"))
 EMBED_SEARCH_BUDGET_SEC = float(_env("EMBED_SEARCH_BUDGET_SEC", "2.5"))
 GEN_BUDGET_SEC = float(_env("GEN_BUDGET_SEC", "4.0"))
-METADATA_FETCH_BUDGET_SEC = float(_env("METADATA_FETCH_BUDGET_SEC", "0.3"))
 
-AUDIT_S3_BUCKET = _env("AUDIT_S3_BUCKET")  # optional
+AUDIT_S3_BUCKET = _env("AUDIT_S3_BUCKET")
 AUDIT_S3_PREFIX = _env("AUDIT_S3_PREFIX", "audits/")
 
 ALLOWED_LANGUAGES = set(["en", "hi", "ta"])
 ALLOWED_CHANNELS = set(["web", "sms", "voice"])
 
-# Intent blocklist (very small/safe heuristics). If matched -> deterministic refusal.
 INTENT_BLOCKLIST_PATTERNS = {
-    "medical": re.compile(r"\b(medic(al|ine)|prescribe|diagnos|symptom|pill|dosage)\b", re.I),
-    "legal": re.compile(r"\b(attorney|sue|lawsuit|contract|custody|divorce|legal advice|crime)\b", re.I),
+    "medical": re.compile(r"\b(medic(al|ine|ation)|prescrib|diagnos|symptom|pill|dosage|treatment)\b", re.I),
+    "legal": re.compile(r"\b(attorney|sue|lawsuit|contract|custody|divorce|legal advice|crime|sentence)\b", re.I),
 }
-
-# Guidance keys returned when refusing
 GUIDANCE_KEYS = {
     "medical": "refusal_medical",
     "legal": "refusal_legal",
     "asr_low_confidence": "refusal_asr_low_confidence",
     "insufficient_evidence": "refusal_insufficient_evidence",
+    "invalid_request": "refusal_invalid_request",
 }
 
-# AWS clients (lazy)
-_s3_client = None
+CITATION_PAT = re.compile(r"\[(\d+)\]\s*$")
+DISALLOWED_SUBSTRINGS = ("http://", "https://", "www.", "file://")
 
+jlog({"event": "startup_ok", "region": AWS_REGION, "min_similarity": MIN_SIMILARITY, "asr_threshold": ASR_CONF_THRESHOLD})
+
+_s3_client = None
 
 def init_s3_client():
     global _s3_client
@@ -149,15 +89,29 @@ def init_s3_client():
         _s3_client = None
     return _s3_client
 
+def _write_audit(record: Dict[str, Any]) -> None:
+    if not AUDIT_S3_BUCKET:
+        jlog({"event": "audit_skipped", "reason": "no_audit_bucket"})
+        return
+    client = init_s3_client()
+    if client is None:
+        jlog({"event": "audit_skipped", "reason": "s3_unavailable"})
+        return
+    try:
+        date_prefix = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        key = f"{AUDIT_S3_PREFIX.rstrip('/')}/{date_prefix}/{record.get('request_id')}.json"
+        client.put_object(Bucket=AUDIT_S3_BUCKET, Key=key, Body=json.dumps(record, default=str).encode("utf-8"))
+        jlog({"event": "audit_written", "request_id": record.get("request_id"), "s3_key": key})
+    except Exception as e:
+        jlog({"level": "WARN", "event": "audit_write_failed", "request_id": record.get("request_id"), "detail": str(e)})
 
-# ---- Helper validators ----
-def _validate_request_shape(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Basic presence checks and normalization
+def _validate_request_shape(ev: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    req = {}
     req_id = ev.get("request_id") or f"r-{int(time.time() * 1000)}"
     language = (ev.get("language") or "").strip().lower()
     channel = (ev.get("channel") or "").strip().lower()
     query_text = (ev.get("query") or ev.get("question") or "").strip()
-    # top_k/raw_k optional ints
+    session_id = ev.get("session_id")
     try:
         top_k = int(ev.get("top_k")) if ev.get("top_k") is not None else None
     except Exception:
@@ -168,64 +122,110 @@ def _validate_request_shape(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         raw_k = None
 
     if not language or language not in ALLOWED_LANGUAGES:
-        return {"error": "invalid_language", "request_id": req_id}
+        return None, {"error": "invalid_language", "request_id": req_id}
     if not channel or channel not in ALLOWED_CHANNELS:
-        return {"error": "invalid_channel", "request_id": req_id}
+        return None, {"error": "invalid_channel", "request_id": req_id}
     if not query_text:
-        return {"error": "empty_query", "request_id": req_id}
+        return None, {"error": "empty_query", "request_id": req_id}
+    asr_confidence = None
     if channel == "voice":
-        asr_conf = ev.get("asr_confidence")
         try:
-            asr_conf = float(asr_conf) if asr_conf is not None else None
+            asr_confidence = float(ev.get("asr_confidence")) if ev.get("asr_confidence") is not None else None
         except Exception:
-            asr_conf = None
-        if asr_conf is None:
-            return {"error": "missing_asr_confidence", "request_id": req_id}
-    else:
-        asr_conf = None
+            asr_confidence = None
+        if asr_confidence is None:
+            return None, {"error": "missing_asr_confidence", "request_id": req_id}
 
-    return {
-        "request_id": req_id,
-        "session_id": ev.get("session_id"),
-        "language": language,
-        "channel": channel,
-        "query": query_text,
-        "top_k": top_k,
-        "raw_k": raw_k,
-        "asr_confidence": asr_conf,
-        "region": ev.get("region"),
-    }
-
+    req.update(
+        {
+            "request_id": req_id,
+            "session_id": session_id,
+            "language": language,
+            "channel": channel,
+            "query": query_text,
+            "top_k": top_k,
+            "raw_k": raw_k,
+            "asr_confidence": asr_confidence,
+            "region": ev.get("region"),
+            "filters": ev.get("filters", {}),
+        }
+    )
+    return req, None
 
 def _intent_blocked(query: str) -> Optional[str]:
-    """Return guidance_key if intent falls into a blocked class."""
     for k, pat in INTENT_BLOCKLIST_PATTERNS.items():
         if pat.search(query):
             return GUIDANCE_KEYS.get(k)
     return None
 
-
 def _enforce_asr(asr_confidence: Optional[float]) -> Optional[str]:
     if asr_confidence is None:
         return None
     if float(asr_confidence) < ASR_CONF_THRESHOLD:
-        return GUIDANCE_KEYS["asr_low_confidence"]
+        return "asr_low_confidence"
     return None
 
+def _validate_generator_output_and_extract_lines(gen_res: Dict[str, Any], passages: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    decision = gen_res.get("decision")
+    if decision == "NOT_ENOUGH_INFORMATION":
+        return "NOT_ENOUGH_INFORMATION", []
 
-def _top_similarity_from_retrieval(res: Dict[str, Any]) -> float:
-    try:
-        return float(res.get("top_similarity") or 0.0)
-    except Exception:
-        return 0.0
+    raw_lines: List[str] = []
+    if isinstance(gen_res.get("answer_lines"), list) and gen_res.get("answer_lines"):
+        for el in gen_res.get("answer_lines"):
+            if isinstance(el, dict) and isinstance(el.get("text"), str):
+                for ln in el.get("text").splitlines():
+                    if ln.strip():
+                        raw_lines.append(ln.strip())
+            elif isinstance(el, str):
+                for ln in el.splitlines():
+                    if ln.strip():
+                        raw_lines.append(ln.strip())
+    else:
+        found = None
+        for k in ("text", "output", "result", "body"):
+            v = gen_res.get(k)
+            if isinstance(v, str) and v.strip():
+                found = v
+                break
+        if found is None:
+            return "INVALID_OUTPUT", []
+        for ln in found.splitlines():
+            if ln.strip():
+                raw_lines.append(ln.strip())
 
+    if not raw_lines:
+        return "INVALID_OUTPUT", []
 
-# ---- Metadata hydration (best-effort) ----
+    max_pass = 0
+    for p in passages:
+        try:
+            n = int(p.get("number", 0))
+            if n > max_pass:
+                max_pass = n
+        except Exception:
+            continue
+    if max_pass < 1:
+        return "INVALID_OUTPUT", []
+
+    validated_lines: List[Dict[str, Any]] = []
+    for ln in raw_lines:
+        m = CITATION_PAT.search(ln)
+        if not m:
+            jlog({"event": "validation_failed", "reason": "missing_citation", "line": ln})
+            return "INVALID_OUTPUT", []
+        cited = int(m.group(1))
+        if cited < 1 or cited > max_pass:
+            jlog({"event": "validation_failed", "reason": "citation_out_of_range", "line": ln, "cited": cited, "max_pass": max_pass})
+            return "INVALID_OUTPUT", []
+        lower = ln.lower()
+        if any(s in lower for s in DISALLOWED_SUBSTRINGS):
+            jlog({"event": "validation_failed", "reason": "disallowed_substring", "line": ln})
+            return "INVALID_OUTPUT", []
+        validated_lines.append({"text": ln})
+    return "ACCEPT", validated_lines
+
 def _hydrate_citation_metadata(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Build citations array from passages. We use passage.meta and source_url returned by retriever.
-    This is best-effort and intentionally light-weight (no extra network calls).
-    """
     citations = []
     for p in passages:
         citations.append(
@@ -238,41 +238,24 @@ def _hydrate_citation_metadata(passages: List[Dict[str, Any]]) -> List[Dict[str,
         )
     return citations
 
-
-# ---- Audit write (S3) ----
-def _write_audit(record: Dict[str, Any]) -> None:
-    if not AUDIT_S3_BUCKET:
-        # audit disabled
-        jlog({"event": "audit_skipped", "reason": "no_audit_bucket"})
-        return
-    try:
-        client = init_s3_client()
-        if client is None:
-            jlog({"event": "audit_skipped", "reason": "s3_client_unavailable"})
-            return
-        date_prefix = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        key = f"{AUDIT_S3_PREFIX.rstrip('/')}/{date_prefix}/{record.get('request_id')}.json"
-        body = json.dumps(record, default=str)
-        client.put_object(Bucket=AUDIT_S3_BUCKET, Key=key, Body=body.encode("utf-8"))
-        jlog({"event": "audit_written", "request_id": record.get("request_id"), "s3_key": key})
-    except Exception as e:
-        jlog({"level": "WARN", "event": "audit_write_failed", "detail": str(e), "request_id": record.get("request_id")})
-
-
-# ---- Orchestration: handle a single canonical request ----
 def handle(event: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main core entrypoint used internally by adapters: validates, enforces policy, calls retriever and generator,
-    hydrates citations, writes audit, and returns a structured response.
-
-    Returns canonical response object described in module docstring.
-    """
     start_time = time.time()
-    validated = _validate_request_shape(event)
-    if not validated or "error" in validated:
-        req_id = (validated or {}).get("request_id") or f"r-{int(time.time() * 1000)}"
-        jlog({"level": "ERROR", "event": "invalid_request_shape", "detail": validated, "request_id": req_id})
-        return {"request_id": req_id, "resolution": "refusal", "guidance_key": "invalid_request", "reason": validated}
+    validated, error = _validate_request_shape(event)
+    if error:
+        jlog({"level": "ERROR", "event": "invalid_request_shape", "detail": error, "request_id": error.get("request_id")})
+        _write_audit(
+            {
+                "session_id": event.get("session_id"),
+                "request_id": error.get("request_id"),
+                "language": event.get("language"),
+                "channel": event.get("channel"),
+                "used_chunk_ids": [],
+                "resolution": "refusal",
+                "guidance_key": GUIDANCE_KEYS.get("invalid_request"),
+                "timing_ms": int((time.time() - start_time) * 1000),
+            }
+        )
+        return {"request_id": error.get("request_id"), "resolution": "refusal", "guidance_key": GUIDANCE_KEYS.get("invalid_request")}
 
     request_id = validated["request_id"]
     session_id = validated.get("session_id")
@@ -281,14 +264,14 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
     query_text = validated["query"]
     top_k = validated["top_k"]
     raw_k = validated["raw_k"]
+    filters = validated.get("filters", {})
 
     jlog({"event": "request_start", "request_id": request_id, "session_id": session_id, "language": language, "channel": channel})
 
-    # 1) ASR gating for voice
     if channel == "voice":
         asr_conf = validated.get("asr_confidence")
-        asr_refusal = _enforce_asr(asr_conf)
-        if asr_refusal:
+        asr_issue = _enforce_asr(asr_conf)
+        if asr_issue:
             jlog({"event": "refuse_asr", "request_id": request_id, "asr_confidence": asr_conf})
             _write_audit(
                 {
@@ -298,16 +281,15 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
                     "channel": channel,
                     "used_chunk_ids": [],
                     "resolution": "refusal",
-                    "guidance_key": asr_refusal,
+                    "guidance_key": GUIDANCE_KEYS.get("asr_low_confidence"),
                     "timing_ms": int((time.time() - start_time) * 1000),
                 }
             )
-            return {"request_id": request_id, "resolution": "refusal", "guidance_key": asr_refusal}
+            return {"request_id": request_id, "resolution": "refusal", "guidance_key": GUIDANCE_KEYS.get("asr_low_confidence")}
 
-    # 2) Intent classification (blocklist)
-    guidance = _intent_blocked(query_text)
-    if guidance:
-        jlog({"event": "intent_blocked", "request_id": request_id, "guidance_key": guidance})
+    guid = _intent_blocked(query_text)
+    if guid:
+        jlog({"event": "intent_blocked", "request_id": request_id, "guidance_key": guid})
         _write_audit(
             {
                 "session_id": session_id,
@@ -316,23 +298,16 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
                 "channel": channel,
                 "used_chunk_ids": [],
                 "resolution": "refusal",
-                "guidance_key": guidance,
+                "guidance_key": guid,
                 "timing_ms": int((time.time() - start_time) * 1000),
             }
         )
-        return {"request_id": request_id, "resolution": "refusal", "guidance_key": guidance}
+        return {"request_id": request_id, "resolution": "refusal", "guidance_key": guid}
 
-    # 3) Retrieval
-    retrieval_ev = {
-        "request_id": request_id,
-        "query": query_text,
-        "top_k": top_k,
-        "raw_k": raw_k,
-        "filters": event.get("filters", {}),
-    }
+    retr_ev = {"request_id": request_id, "query": query_text, "top_k": top_k, "raw_k": raw_k, "filters": filters}
     t_retr_start = time.time()
     try:
-        retr_res = retriever.retrieve(retrieval_ev)
+        retr_res = retriever.retrieve(retr_ev)
     except Exception as e:
         jlog({"level": "ERROR", "event": "retriever_exception", "request_id": request_id, "detail": str(e)})
         _write_audit(
@@ -350,14 +325,13 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
     t_retr_ms = int((time.time() - t_retr_start) * 1000)
     jlog({"event": "retriever_returned", "request_id": request_id, "retrieval_ms": t_retr_ms, "top_similarity": retr_res.get("top_similarity")})
 
-    # Enforce retrieval budgets heuristically
     if t_retr_ms / 1000.0 > EMBED_SEARCH_BUDGET_SEC:
         jlog({"level": "WARN", "event": "retrieval_slow", "request_id": request_id, "retrieval_ms": t_retr_ms, "budget_sec": EMBED_SEARCH_BUDGET_SEC})
 
-    # If no candidates -> deterministic not_enough_info
     passages = retr_res.get("passages") or []
     chunk_ids = retr_res.get("chunk_ids") or []
-    top_similarity = _top_similarity_from_retrieval(retr_res)
+    top_similarity = float(retr_res.get("top_similarity") or 0.0)
+
     if not passages:
         jlog({"event": "no_candidates", "request_id": request_id})
         _write_audit(
@@ -373,7 +347,6 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"request_id": request_id, "resolution": "not_enough_info"}
 
-    # Minimum similarity gate
     if top_similarity < MIN_SIMILARITY:
         jlog({"event": "too_low_similarity", "request_id": request_id, "top_similarity": top_similarity, "min_similarity": MIN_SIMILARITY})
         _write_audit(
@@ -389,13 +362,7 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"request_id": request_id, "resolution": "not_enough_info", "top_similarity": top_similarity}
 
-    # 4) Call generator (grounded)
-    gen_ev = {
-        "request_id": request_id,
-        "language": language,
-        "question": query_text,
-        "passages": passages,
-    }
+    gen_ev = {"request_id": request_id, "language": language, "question": query_text, "passages": passages}
     t_gen_start = time.time()
     try:
         gen_res = generator.generate(gen_ev)
@@ -419,9 +386,8 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
     if t_gen_ms / 1000.0 > GEN_BUDGET_SEC:
         jlog({"level": "WARN", "event": "generation_slow", "request_id": request_id, "gen_ms": t_gen_ms, "budget_sec": GEN_BUDGET_SEC})
 
-    # 5) Interpret generator decision and form response
-    decision = gen_res.get("decision")
-    if decision == "NOT_ENOUGH_INFORMATION":
+    validation_decision, validated_lines = _validate_generator_output_and_extract_lines(gen_res, passages)
+    if validation_decision == "NOT_ENOUGH_INFORMATION":
         jlog({"event": "generator_refuse_no_info", "request_id": request_id})
         _write_audit(
             {
@@ -436,8 +402,8 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"request_id": request_id, "resolution": "not_enough_info"}
 
-    if decision != "ACCEPT":
-        jlog({"level": "ERROR", "event": "generator_invalid_output", "request_id": request_id, "decision": decision})
+    if validation_decision != "ACCEPT":
+        jlog({"level": "ERROR", "event": "generator_invalid_output", "request_id": request_id, "validation_decision": validation_decision})
         _write_audit(
             {
                 "session_id": session_id,
@@ -451,42 +417,17 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {"request_id": request_id, "resolution": "invalid_output"}
 
-    # Ensure answer_lines exist
-    answer_lines = gen_res.get("answer_lines") or []
-    if not isinstance(answer_lines, list) or not answer_lines:
-        jlog({"level": "ERROR", "event": "generator_accepted_but_no_answer", "request_id": request_id})
-        _write_audit(
-            {
-                "session_id": session_id,
-                "request_id": request_id,
-                "language": language,
-                "channel": channel,
-                "used_chunk_ids": chunk_ids,
-                "resolution": "invalid_output",
-                "timing_ms": int((time.time() - start_time) * 1000),
-            }
-        )
-        return {"request_id": request_id, "resolution": "invalid_output"}
-
-    # 6) Hydrate citation metadata (best-effort)
     citations = _hydrate_citation_metadata(passages)
 
-    # Build final answer_lines (as returned by generator) and include citations mapping
-    response_answer_lines = []
-    for ln in answer_lines:
-        text = ln.get("text") if isinstance(ln, dict) else str(ln)
-        response_answer_lines.append({"text": text})
-
-    # Final response
+    response_answer_lines = validated_lines
     res = {
         "request_id": request_id,
         "resolution": "answer",
         "answer_lines": response_answer_lines,
         "citations": citations,
-        "confidence": gen_res.get("confidence", "low"),
+        "confidence": gen_res.get("confidence", "high"),
     }
 
-    # 7) Audit (write record)
     _write_audit(
         {
             "session_id": session_id,
@@ -497,7 +438,7 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
             "used_chunk_ids": chunk_ids,
             "top_similarity": top_similarity,
             "resolution": res["resolution"],
-            "generator_decision": decision,
+            "generator_decision": gen_res.get("decision"),
             "timing_ms": int((time.time() - start_time) * 1000),
         }
     )
@@ -505,15 +446,12 @@ def handle(event: Dict[str, Any]) -> Dict[str, Any]:
     jlog({"event": "request_complete", "request_id": request_id, "resolution": res["resolution"], "returned_lines": len(response_answer_lines)})
     return res
 
-
-# Lambda handler (adapter common entrypoint)
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     try:
         return handle(event)
     except Exception as e:
         jlog({"level": "ERROR", "event": "handler_unexpected", "detail": str(e)})
-        req_id = (event.get("request_id") if isinstance(event, dict) else None) or f"r-{int(time.time()*1000)}"
-        # Best-effort audit
+        req_id = event.get("request_id") if isinstance(event, dict) else None or f"r-{int(time.time() * 1000)}"
         _write_audit(
             {
                 "session_id": event.get("session_id") if isinstance(event, dict) else None,
@@ -523,12 +461,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "used_chunk_ids": [],
                 "resolution": "invalid_output",
                 "error": str(e),
-                "timing_ms": int((time.time() - (context.get_remaining_time_in_millis() / 1000) if context and hasattr(context, 'get_remaining_time_in_millis') else 0) * 1000),
+                "timing_ms": int((time.time() - (context.get_remaining_time_in_millis() / 1000) if context and hasattr(context, "get_remaining_time_in_millis") else 0) * 1000),
             }
         )
         return {"request_id": req_id, "resolution": "invalid_output", "error": "handler_exception"}
 
-# CLI parity for local tests
 if __name__ == "__main__":
     sample = {
         "session_id": "local-sess",
