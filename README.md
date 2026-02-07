@@ -15,6 +15,7 @@ export S3_BUCKET="civic-data-raw-prod"     # S3 bucket for raw source documents,
 export PULUMI_STATE_BUCKET="pulumi-backend-670"          # S3 bucket backing Pulumi remote state for IaC deployments
 export FRONTEND_UI_BUCKET="civic-bucket-for-ui"          # S3 bucket hosting the static frontend UI assets
 
+
 make create-s3
 make upload-force
 export SKIP_WEB_SCRAPING=false && make ELT
