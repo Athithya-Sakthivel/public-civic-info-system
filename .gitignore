@@ -10,3 +10,4 @@ venv
 outputs.json
 output.json
 __pycache__/
+audits
